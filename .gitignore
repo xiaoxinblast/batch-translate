@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+data/batch_state.json
+data/_working_*
+data/tm_memory.json
+exports/*
+!exports/.gitkeep
