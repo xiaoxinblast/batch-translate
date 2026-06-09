@@ -65,20 +65,22 @@ def _accumulate_tm(export_file: Path, tm_path: str):
 
 
 def _enrich_working_json(json_path: Path, state: dict):
-    """对工作 JSON 做术语/TM/风格指南增强（非 mqxliff 格式用）。"""
-    if state["source_format"] == "mqxliff":
-        return  # mqxliff_tool.py export 已做增强
-
+    """对工作 JSON 做术语/TM/风格指南增强。"""
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # style_guide
+    # style_guide（所有格式都需要嵌入，供 review-only 模式使用）
     sg_path = state.get("style_guide_path")
-    if sg_path:
-        from pathlib import Path as P
-        sg = P(sg_path)
+    if sg_path and not data.get("style_guide"):
+        sg = Path(sg_path)
         if sg.is_file():
             data["style_guide"] = sg.read_text(encoding="utf-8")
+
+    if state["source_format"] == "mqxliff":
+        # TM/terms 由 mqxliff_tool.py export 已做，只需补 style_guide
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return
 
     # terms
     terms_path = state.get("terms_path")
@@ -214,8 +216,8 @@ def cmd_init(
 # next
 # ═══════════════════════════════════════════════════════════════════════
 
-def cmd_next():
-    """输出当前批次的翻译 JSON。"""
+def cmd_next(review_only: bool = False):
+    """输出当前批次的翻译 JSON（或校对 JSON，若 review_only=True）。"""
     state = _load_state()
 
     # 检查是否已完成
@@ -252,6 +254,55 @@ def cmd_next():
                     "target": tgt,
                 })
 
+    if review_only:
+        # ── 校对模式：直接生成 review JSON（跳过翻译） ──
+        out_path = _SCRIPT_DIR / "exports" / f"_batch_{batch_num:03d}_to_review.json"
+        review = {}
+        review["instructions"] = (
+            "逐条核对译文与原文：1)术语是否准确统一 2)标点格式是否符合规范 "
+            "3)语气是否符合角色 4)表达是否自然流畅、无翻译腔。"
+            "发现问题直接修正，无需标注。"
+        )
+        if data.get("style_guide"):
+            review["style_guide"] = data["style_guide"]
+        if context_entries:
+            review["previous"] = context_entries
+        review["batch"] = batch_num
+        review["total_batches"] = state["total_batches"]
+
+        review_entries = []
+        for e in entries[start:end]:
+            item = {
+                "id": e["id"],
+                "source": e["source"],
+                "translated": e.get("target", ""),
+            }
+            if e.get("context"):
+                item["context"] = e["context"]
+            if e.get("note"):
+                item["note"] = e["note"]
+            if e.get("terms"):
+                item["terms"] = e["terms"]
+            if e.get("tm_matches"):
+                item["tm_matches"] = e["tm_matches"]
+            review_entries.append(item)
+        review["entries"] = review_entries
+
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(review, f, ensure_ascii=False, indent=2)
+
+        existing = sum(1 for e in review_entries if e["translated"])
+        print(f"📝 Batch {batch_num}/{state['total_batches']}  条目 {start + 1}-{end}（共 {total} 条）")
+        print(f"   模式: 校对（跳过翻译）")
+        print(f"   输出: {out_path.name}")
+        print(f"   其中 {existing}/{len(review_entries)} 条已有译文")
+        if context_entries:
+            print(f"   上文: {len(context_entries)} 条")
+        print(f"   校对后请将修正结果保存为 JSON，运行:")
+        print(f"   python batch_translate/batch.py submit <reviewed.json>")
+        return
+
+    # ── 翻译模式 ──
     # 当前批次条目（去掉 target 字段，AI 只需要 source/terms/tm/context）
     batch_entries = []
     for e in entries[start:end]:
@@ -269,7 +320,7 @@ def cmd_next():
             item["tm_matches"] = e["tm_matches"]
         batch_entries.append(item)
 
-    # 构建 batch JSON（顺序：instructions → style_guide → previous → metadata → entries）
+    # 构建 batch JSON
     batch = {}
     batch["instructions"] = (
         "翻译过程中遇到任何不确定的术语、专有名词、角色名、上下文含义时，"
@@ -284,7 +335,6 @@ def cmd_next():
     batch["total_batches"] = state["total_batches"]
     batch["entries"] = batch_entries
 
-    # 输出文件
     out_path = _SCRIPT_DIR / "exports" / f"_batch_{batch_num:03d}_to_translate.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(batch, f, ensure_ascii=False, indent=2)
@@ -497,7 +547,8 @@ def main():
     p_init.add_argument("--target-col", type=str, default="B", help="xlsx 目标列（默认 B）")
     p_init.add_argument("--header-row", type=int, default=1, help="xlsx 表头行号（默认 1）")
 
-    p_next = sub.add_parser("next", help="输出当前批翻译 JSON")
+    p_next = sub.add_parser("next", help="输出当前批翻译 JSON（--review 跳过翻译，直接校对）")
+    p_next.add_argument("--review", action="store_true", help="跳过翻译，直接生成校对 JSON（用于已有译文的文件）")
     p_review = sub.add_parser("review", help="生成校对 JSON（翻译结果+原文对照）")
     p_review.add_argument("result", type=str, help="翻译结果 JSON 路径")
     p_submit = sub.add_parser("submit", help="提交校对结果并推进")
@@ -519,7 +570,7 @@ def main():
             header_row=args.header_row,
         )
     elif args.command == "next":
-        cmd_next()
+        cmd_next(review_only=args.review)
     elif args.command == "review":
         cmd_review(Path(args.result))
     elif args.command == "submit":
