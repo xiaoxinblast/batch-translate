@@ -160,6 +160,45 @@ def _generate_summary(entries: list, batches: list, batch_chars: int) -> str:
     return "\n".join(lines)
 
 
+def _generate_samples(entries: list, out_path: Path):
+    """生成上下文样本 JSON，供分析 Agent 做内容级语境分析。"""
+    import re, json
+    _tag_re = re.compile(r"<tag[^>]*/>")
+
+    # 按 context 前缀分组，每组取代表性样本（首、中、尾各一条）
+    groups = {}
+    for e in entries:
+        ctx = e.get("context", "") or ""
+        prefix = ctx.split(".")[0] if "." in ctx else (ctx or "(无上下文)")
+        if prefix not in groups:
+            groups[prefix] = []
+        groups[prefix].append(e)
+
+    samples = []
+    for prefix, group in sorted(groups.items(), key=lambda x: -len(x[1])):
+        n = len(group)
+        # 取首、中、尾各一条，去重
+        indices = {0, n // 2, n - 1}
+        picked = []
+        for i in sorted(indices):
+            if i < n:
+                e = group[i]
+                picked.append({
+                    "id": e["id"],
+                    "source": _tag_re.sub("", e["source"]),
+                    "context": e.get("context", ""),
+                    "note": e.get("note", ""),
+                })
+        samples.append({
+            "prefix": prefix,
+            "count": n,
+            "examples": picked,
+        })
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump({"groups": samples, "total_groups": len(samples)}, f, ensure_ascii=False, indent=2)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # init
 # ═══════════════════════════════════════════════════════════════════════
@@ -227,8 +266,12 @@ def cmd_init(
     if not data.get("style_guide") and style_guide_path and style_guide_path.is_file():
         data["style_guide"] = style_guide_path.read_text(encoding="utf-8")
 
-    # 生成文档结构摘要
+    # 生成文档摘要
     document_summary = _generate_summary(entries, batches, batch_chars)
+
+    # 生成上下文样本文件（供分析 Agent 做内容级分析）
+    samples_path = _SCRIPT_DIR / "exports" / "_context_samples.json"
+    _generate_samples(entries, samples_path)
 
     state = {
         "source_file": str(work_file.resolve()),
