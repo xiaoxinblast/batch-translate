@@ -123,7 +123,7 @@ def _enrich_working_json(json_path: Path, state: dict):
 
 def cmd_init(
     source_path: Path,
-    batch_size: int = 30,
+    batch_chars: int = 3000,
     context_size: int = 5,
     terms_path: Optional[Path] = None,
     tm_path: Optional[Path] = None,
@@ -159,8 +159,26 @@ def cmd_init(
     # 加载中间 JSON
     with open(export_file, "r", encoding="utf-8") as f:
         data = json.load(f)
-    total = len(data["entries"])
-    total_batches = (total + batch_size - 1) // batch_size
+    entries = data["entries"]
+    total = len(entries)
+
+    # 按字数分批
+    import re
+    _tag_re = re.compile(r"<tag[^>]*/>")
+    batches = []
+    start = 0
+    cum = 0
+    for i, e in enumerate(entries):
+        plain = _tag_re.sub("", e["source"])
+        char_len = len(plain)
+        if cum + char_len > batch_chars and cum > 0:
+            batches.append((start, i))
+            start = i
+            cum = 0
+        cum += char_len
+    if start < total:
+        batches.append((start, total))
+    total_batches = len(batches)
 
     # 加载 style_guide（如果 parse 阶段没加载）
     if not data.get("style_guide") and style_guide_path and style_guide_path.is_file():
@@ -171,20 +189,22 @@ def cmd_init(
         "source_format": data.get("_format", source_path.suffix.lower().lstrip(".")),
         "export_file": str(export_file.resolve()),
         "total": total,
-        "batch_size": batch_size,
+        "batch_chars": batch_chars,
         "context_size": context_size,
         "total_batches": total_batches,
+        "batches": batches,
         "current_batch": 0,
-        "next_index": 0,
         "terms_path": str(terms_path.resolve()) if terms_path else None,
         "tm_path": str(tm_path.resolve()) if tm_path else None,
         "style_guide_path": str(style_guide_path.resolve()) if style_guide_path else None,
     }
     _save_state(state)
 
+    # 显示分批信息
+    avg = sum(e - s for s, e in batches) / total_batches
     print(f"✅ 初始化完成")
     print(f"   文件: {export_file.name}")
-    print(f"   总数: {total} 条, 每批 {batch_size} 条, 共 {total_batches} 批")
+    print(f"   总数: {total} 条, 每批 ~{batch_chars} 字, 共 {total_batches} 批（平均 ~{avg:.0f} 条/批）")
     print(f"   上下文窗口: {context_size} 条")
     print()
     print("运行 next 获取第一批翻译任务。")
@@ -199,7 +219,9 @@ def cmd_next():
     state = _load_state()
 
     # 检查是否已完成
-    if state["next_index"] >= state["total"]:
+    batch_idx = state["current_batch"]
+    batches = state["batches"]
+    if batch_idx >= len(batches):
         print("✅ 全部翻译完成！")
         return
 
@@ -213,11 +235,9 @@ def cmd_next():
 
     entries = data["entries"]
     total = state["total"]
-    batch_size = state["batch_size"]
     context_size = state["context_size"]
-    start = state["next_index"]
-    end = min(start + batch_size, total)
-    batch_num = state["current_batch"] + 1
+    start, end = batches[batch_idx]
+    batch_num = batch_idx + 1
 
     # 上文：上一批末尾的 N 条已译条目
     context_entries = []
@@ -358,11 +378,10 @@ def cmd_submit(result_path: Path):
 
     # 推进状态
     state["current_batch"] += 1
-    state["next_index"] = min(state["next_index"] + state["batch_size"], state["total"])
     _save_state(state)
 
     # 检查是否全部完成
-    if state["next_index"] >= state["total"]:
+    if state["current_batch"] >= len(state["batches"]):
         print()
         print("🎉 全部翻译完成！")
         _STATE_FILE.unlink(missing_ok=True)
@@ -443,8 +462,13 @@ def cmd_status():
         return
 
     state = _load_state()
-    print(f"进度: {state['next_index']}/{state['total']} ({state['current_batch']}/{state['total_batches']} 批)")
-    print(f"每批: {state['batch_size']} 条, 上下文: {state['context_size']} 条")
+    batch_idx = state["current_batch"]
+    if batch_idx < len(state["batches"]):
+        s, e = state["batches"][batch_idx]
+        print(f"进度: {e}/{state['total']} 条 ({batch_idx}/{state['total_batches']} 批)")
+    else:
+        print(f"进度: {state['total']}/{state['total']} 条（全部完成）")
+    print(f"每批 ~{state['batch_chars']} 字, 上下文: {state['context_size']} 条")
     print(f"源文件: {state.get('source_file', state.get('mqxliff_file', 'unknown'))}")
     if state.get('tm_path'):
         tm = Path(state['tm_path'])
@@ -464,7 +488,7 @@ def main():
 
     p_init = sub.add_parser("init", help="初始化批量翻译")
     p_init.add_argument("file", type=str, help="源文件路径（mqxliff/docx/xlsx/txt...）")
-    p_init.add_argument("--batch-size", type=int, default=30, help="每批条数（默认 30）")
+    p_init.add_argument("--batch-chars", type=int, default=3000, help="每批字数阈值（默认 3000）")
     p_init.add_argument("--context-size", type=int, default=5, help="上文条数（默认 5）")
     p_init.add_argument("--terms", type=str, default=None, help="术语库 xlsx 路径")
     p_init.add_argument("--tm", type=str, default=None, help="翻译记忆 JSON 路径")
@@ -485,7 +509,7 @@ def main():
     if args.command == "init":
         cmd_init(
             source_path=Path(args.file),
-            batch_size=args.batch_size,
+            batch_chars=args.batch_chars,
             context_size=args.context_size,
             terms_path=Path(args.terms) if args.terms else None,
             tm_path=Path(args.tm) if args.tm else None,
