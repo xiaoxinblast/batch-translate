@@ -9,36 +9,43 @@
 #    data/style_guide.txt — 项目翻译规范
 #    data/term_base.xlsx — 术语表（原文 | 译文 | 注释）
 
-# 2. 初始化（自动检测格式）
+# 2. 初始化（自动检测格式 + 生成文档结构摘要）
 python batch_translate/batch.py init <文件> \
-  --batch-size 30 --context-size 5 \
+  --batch-chars 3000 --context-size 5 \
   --terms batch_translate/data/term_base.xlsx \
   --tm batch_translate/data/tm_memory.json \
   --style-guide batch_translate/data/style_guide.txt
 
-# 3. 获取第一批
+# 3. （可选）派 Agent 全量分析语境，结果存入 state
+# 4. 获取第一批
 python batch_translate/batch.py next
 
-# 4. 翻译 → 校对 → 提交（循环）
+# 5. 翻译 → 校对 → 提交（循环）
 python batch_translate/batch.py review <翻译结果.json>
 python batch_translate/batch.py submit <校对结果.json>
+
+# 仅校对模式（文件已有译文）
+python batch_translate/batch.py next --review
 ```
 
 ## 工作流
 
 ```
-源文件 → parse → 中间 JSON → 分批 → AI 翻译 → 校对 → write + TM → 循环
+源文件 → parse → init（统计摘要） → Agent 全量语境分析 → 分批
+                                                           │
+                                              翻译 → 校对 → submit → 循环
 ```
 
-每批五步：
+每批步骤：
 
-| 步骤 | 命令 | 输入 → 输出 |
-|------|------|------------|
-| 分发 | `batch.py next` | 状态 → `_batch_NNN_to_translate.json` |
-| 翻译 | AI Agent | 翻译 JSON → `_batch_NNN_translated.json` |
-| 校对 | `batch.py review` | 翻译结果 → `_batch_NNN_to_review.json` |
-| 检查 | AI Agent | 校对 JSON → `_batch_NNN_reviewed.json` |
-| 提交 | `batch.py submit` | 校对结果 → write + TM + 下一批 |
+| 步骤 | 命令 | 说明 |
+|------|------|------|
+| 分析 | Agent 读 `_working.json` | 全量语境分析（跨区域关联、叙事脉络） |
+| 分发 | `batch.py next` | 含 document_summary + style_guide |
+| 翻译 | AI Agent（opus） | 含 terms + tm_matches |
+| 校对 | `batch.py review` | source + translated 对照 |
+| 检查 | AI Agent（opus） | 修正术语/标点/语气/流畅度 |
+| 提交 | `batch.py submit` | write + TM + 下一批 |
 
 ## 支持格式
 
