@@ -119,6 +119,47 @@ def _enrich_working_json(json_path: Path, state: dict):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def _generate_summary(entries: list, batches: list, batch_chars: int) -> str:
+    """生成文档结构摘要。"""
+    import re
+    _tag_re = re.compile(r"<tag[^>]*/>")
+
+    total = len(entries)
+    total_chars = sum(len(_tag_re.sub("", e["source"])) for e in entries)
+    has_tags = sum(1 for e in entries if "<tag" in e["source"])
+
+    # 按长度分类
+    short = sum(1 for e in entries if len(_tag_re.sub("", e["source"])) <= 20)
+    medium = sum(1 for e in entries if 20 < len(_tag_re.sub("", e["source"])) <= 80)
+    long = sum(1 for e in entries if len(_tag_re.sub("", e["source"])) > 80)
+
+    # 按 context 前缀分布
+    ctx_groups = {}
+    for e in entries:
+        ctx = e.get("context", "") or ""
+        prefix = ctx.split(".")[0] if "." in ctx else (ctx or "(无上下文)")
+        ctx_groups[prefix] = ctx_groups.get(prefix, 0) + 1
+
+    # 变量占位符
+    has_vars = sum(1 for e in entries if "{0}" in e["source"] or "{1}" in e["source"])
+
+    lines = [
+        "━" * 40,
+        "文档结构分析",
+        "━" * 40,
+        f"总条目: {total}  总字数: {total_chars}  批次: {len(batches)}（每批 ~{batch_chars} 字）",
+        f"文本类型: 短文本(≤20字) {short}条 | 中等(21-80字) {medium}条 | 长文本(>80字) {long}条",
+        f"内联标签: {has_tags} 条含标签  变量占位符: {has_vars} 条含 {{0}}/{{1}}",
+        "",
+        "上下文分布:",
+    ]
+    for prefix, count in sorted(ctx_groups.items(), key=lambda x: -x[1]):
+        pct = count / total * 100
+        lines.append(f"  {prefix}: {count} 条 ({pct:.0f}%)")
+
+    return "\n".join(lines)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # init
 # ═══════════════════════════════════════════════════════════════════════
@@ -186,6 +227,9 @@ def cmd_init(
     if not data.get("style_guide") and style_guide_path and style_guide_path.is_file():
         data["style_guide"] = style_guide_path.read_text(encoding="utf-8")
 
+    # 生成文档结构摘要
+    document_summary = _generate_summary(entries, batches, batch_chars)
+
     state = {
         "source_file": str(work_file.resolve()),
         "source_format": data.get("_format", source_path.suffix.lower().lstrip(".")),
@@ -196,6 +240,7 @@ def cmd_init(
         "total_batches": total_batches,
         "batches": batches,
         "current_batch": 0,
+        "document_summary": document_summary,
         "terms_path": str(terms_path.resolve()) if terms_path else None,
         "tm_path": str(tm_path.resolve()) if tm_path else None,
         "style_guide_path": str(style_guide_path.resolve()) if style_guide_path else None,
@@ -208,6 +253,8 @@ def cmd_init(
     print(f"   文件: {export_file.name}")
     print(f"   总数: {total} 条, 每批 ~{batch_chars} 字, 共 {total_batches} 批（平均 ~{avg:.0f} 条/批）")
     print(f"   上下文窗口: {context_size} 条")
+    print()
+    print(document_summary)
     print()
     print("运行 next 获取第一批翻译任务。")
 
@@ -263,6 +310,8 @@ def cmd_next(review_only: bool = False):
             "3)语气是否符合角色 4)表达是否自然流畅、无翻译腔。"
             "发现问题直接修正，无需标注。"
         )
+        if state.get("document_summary"):
+            review["document_summary"] = state["document_summary"]
         if data.get("style_guide"):
             review["style_guide"] = data["style_guide"]
         if context_entries:
@@ -327,6 +376,8 @@ def cmd_next(review_only: bool = False):
         "不要猜测，应主动搜索项目文件或联网搜索以获取准确信息后，再给出确定译文。"
         "最终返回结果必须是干净的译文，不要附加任何标注或说明。"
     )
+    if state.get("document_summary"):
+        batch["document_summary"] = state["document_summary"]
     if data.get("style_guide"):
         batch["style_guide"] = data["style_guide"]
     if context_entries:
@@ -476,6 +527,8 @@ def cmd_review(result_path: Path):
         "对不确定的术语或译法，主动搜索项目文件或联网验证后再修正。"
         "发现问题直接修正，无需标注。"
     )
+    if state.get("document_summary"):
+        review["document_summary"] = state["document_summary"]
     if batch_data.get("style_guide"):
         review["style_guide"] = batch_data["style_guide"]
     if batch_data.get("previous"):
