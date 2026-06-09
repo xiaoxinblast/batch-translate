@@ -473,6 +473,7 @@ def cmd_review(result_path: Path):
     review["instructions"] = (
         "逐条核对译文与原文：1)术语是否准确统一 2)标点格式是否符合规范 "
         "3)语气是否符合角色 4)表达是否自然流畅、无翻译腔。"
+        "对不确定的术语或译法，主动搜索项目文件或联网验证后再修正。"
         "发现问题直接修正，无需标注。"
     )
     if batch_data.get("style_guide"):
