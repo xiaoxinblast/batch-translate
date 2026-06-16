@@ -8,7 +8,7 @@ mqxliff（MemoQ） · docx · xlsx · txt · csv · tsv
 
 ## 快速开始
 
-**前置：** 安装 Claude Code Skill（`batch-translate`），然后对 Claude 说：
+**前置：** 安装 Claude Code Skill → [batch-translate-skill](https://github.com/xiaoxinblast/batch-translate-skill)，然后对 Claude 说：
 
 > "开始批量翻译"
 
