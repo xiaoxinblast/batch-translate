@@ -828,7 +828,7 @@ def test_roundtrip(filepath: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="mqxliff 解析/写回工具 — KH4 批量翻译工作流",
+        description="mqxliff 解析/写回工具 — 批量翻译工作流",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
