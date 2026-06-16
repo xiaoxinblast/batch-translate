@@ -120,47 +120,19 @@ def _enrich_working_json(json_path: Path, state: dict):
 
 
 def _generate_summary(entries: list, batches: list, batch_chars: int) -> str:
-    """生成文档结构摘要。"""
+    """生成极简文档摘要。真正的语境分析由 SKILL 步骤 5 的 Agent 完成。"""
     import re
     _tag_re = re.compile(r"<[^>]+>")
 
     total = len(entries)
     total_chars = sum(len(_tag_re.sub("", e["source"])) for e in entries)
     has_tags = sum(1 for e in entries if "<tag" in e["source"])
+    has_target = sum(1 for e in entries if e.get("target", "").strip())
 
-    # 按长度分类
-    short = sum(1 for e in entries if len(_tag_re.sub("", e["source"])) <= 20)
-    medium = sum(1 for e in entries if 20 < len(_tag_re.sub("", e["source"])) <= 80)
-    long = sum(1 for e in entries if len(_tag_re.sub("", e["source"])) > 80)
-
-    # 按 context 前缀分布
-    ctx_groups = {}
-    for e in entries:
-        ctx = e.get("context", "") or ""
-        prefix = ctx.split(".")[0] if "." in ctx else (ctx or "(无上下文)")
-        ctx_groups[prefix] = ctx_groups.get(prefix, 0) + 1
-
-    # 变量占位符
-    has_vars = sum(1 for e in entries if "{0}" in e["source"] or "{1}" in e["source"])
-
-    lines = [
-        "━" * 40,
-        "文档结构分析",
-        "━" * 40,
-        f"总条目: {total}  总字数: {total_chars}  批次: {len(batches)}（每批 ~{batch_chars} 字）",
-        f"文本类型: 短文本(≤20字) {short}条 | 中等(21-80字) {medium}条 | 长文本(>80字) {long}条",
-        f"内联标签: {has_tags} 条含标签  变量占位符: {has_vars} 条含 {{0}}/{{1}}",
-        "",
-        "上下文分布:",
-    ]
-    sorted_ctx = sorted(ctx_groups.items(), key=lambda x: -x[1])
-    for prefix, count in sorted_ctx[:10]:
-        pct = count / total * 100
-        lines.append(f"  {prefix}: {count} 条 ({pct:.0f}%)")
-    if len(sorted_ctx) > 10:
-        lines.append(f"  … 其余 {len(sorted_ctx) - 10} 个上下文分组")
-
-    return "\n".join(lines)
+    return (
+        f"总条目: {total}  纯文本字数: {total_chars}  批次: {len(batches)}（每批 ~{batch_chars} 字）\n"
+        f"内联标签: {has_tags} 条  已有译文: {has_target} 条"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
