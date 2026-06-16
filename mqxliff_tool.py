@@ -55,7 +55,7 @@ NS_MAP = {
 # lxml 命名空间注册：XLIFF 1.2 使用默认 xmlns，lxml 从源文件自动继承
 etree.register_namespace("mq", MQ_NS)
 
-TAG_RE = re.compile(r"<tag\s+id=['\"](\d+)['\"]\s+type=['\"]([^'\"]*)['\"]\s+desc=['\"]([^'\"]*)['\"]\s*/>")
+TAG_RE = re.compile(r"<tag\s+id=['\"]([^'\"]+)['\"]\s+type=['\"]([^'\"]*)['\"]\s+desc=['\"]([^'\"]*)['\"]\s*/>")
 
 NOT_STARTED = "NotStarted"
 PRETRANSLATED = "Pretranslated"
@@ -67,11 +67,12 @@ PRETRANSLATED = "Pretranslated"
 
 @dataclass
 class InlineTag:
-    """内联标签：从 <ph> 解析得到的语义化标记"""
-    ph_id: str              # 原始 ph 的 id 属性
-    tag_type: str           # "fmt" | "/fmt" | "br" | "req"
+    """内联标签：从 <ph>/<bpt>/<ept> 解析得到的语义化标记"""
+    ph_id: str              # 原始元素的 id 属性（ph/bpt/ept 共用）
+    tag_type: str           # "fmt" | "/fmt" | "fmt-open" | "fmt-close" | "br" | "req"
     desc: str               # 人类可读描述
-    original_ph_xml: str    # 原始 <ph> 元素的完整 XML 文本（用于写回）
+    original_ph_xml: str    # 原始元素的完整 XML 文本，不含 tail（用于写回）
+    elem_type: str = "ph"   # 原始 XLIFF 元素类型: "ph" | "bpt" | "ept"
 
 
 @dataclass
@@ -79,12 +80,13 @@ class TransUnit:
     """单个翻译单元"""
     id: str
     status: str
+    is_locked: bool             # mq:locked="locked" 或 translate="no"
     segment_guid: str
     first_label: str
     context: str
     note: str
     source_text: str           # 含 <tag ... /> 标记的原文
-    source_ph_map: dict[str, InlineTag]  # tag_id → InlineTag 映射
+    source_tag_map: dict[str, InlineTag]  # tag_id → InlineTag 映射（含 ph/bpt/ept）
     target_text: str           # 含 <tag ... /> 标记的译文（初始为空）
     has_inline_tags: bool = False
 
@@ -214,13 +216,62 @@ def _describe_format_tag(displaytext: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# <tag/> → <ph> 编码（写回用）
+# <bpt>/<ept> 内联标签解码
 # ═══════════════════════════════════════════════════════════════════════
 
-def _replace_tags_with_ph(text: str, ph_map: dict[str, InlineTag]) -> str:
+# bpt ctype → 中文描述映射
+_BPT_CTYPE_DESC = {
+    "bold": "粗体开始",
+    "underlined": "下划线开始",
+    "italic": "斜体开始",
+}
+_EPT_CTYPE_DESC = {
+    "bold": "粗体结束",
+    "underlined": "下划线结束",
+    "italic": "斜体结束",
+}
+
+
+def _elem_to_xml_no_tail(elem) -> str:
+    """序列化元素，排除 tail。"""
+    copy_elem = copy.deepcopy(elem)
+    copy_elem.tail = None
+    return etree.tostring(copy_elem, encoding="unicode")
+
+
+def _decode_bpt_ept_to_tag(elem, elem_type: str) -> InlineTag:
     """
-    将 text 中的 <tag id='N' ... /> 替换回原始 <ph> XML。
-    返回的字符串是多个 text + <ph> 片段的混合（不是合法 XML，是 XLIFF 的 mixed content）。
+    将 <bpt>/<ept> 元素解码为 InlineTag。
+    bpt: 格式开始标签（粗体/下划线等）
+    ept: 格式结束标签
+    """
+    ph_id = elem.get("id", "")
+    ctype = elem.get("ctype", "")
+
+    if elem_type == "bpt":
+        desc = _BPT_CTYPE_DESC.get(ctype, f"格式开始: {ctype}" if ctype else "格式开始")
+        tag_type = "fmt-open"
+    else:  # ept
+        desc = _EPT_CTYPE_DESC.get(ctype, f"格式结束: {ctype}" if ctype else "格式结束")
+        tag_type = "fmt-close"
+
+    return InlineTag(
+        ph_id=ph_id,
+        tag_type=tag_type,
+        desc=desc,
+        original_ph_xml=_elem_to_xml_no_tail(elem),
+        elem_type=elem_type,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# <tag/> → <ph>/<bpt>/<ept> 编码（写回用）
+# ═══════════════════════════════════════════════════════════════════════
+
+def _replace_tags_with_ph(text: str, tag_map: dict[str, InlineTag]) -> str:
+    """
+    将 text 中的 <tag id='N' ... /> 替换回原始 XLIFF 元素 XML（ph/bpt/ept）。
+    返回的字符串是多个 text + XML 片段的混合（XLIFF mixed content）。
     """
     result_parts = []
     last_end = 0
@@ -231,12 +282,12 @@ def _replace_tags_with_ph(text: str, ph_map: dict[str, InlineTag]) -> str:
             result_parts.append(text[last_end:m.start()])
 
         tag_id = m.group(1)
-        if tag_id in ph_map:
-            result_parts.append(ph_map[tag_id].original_ph_xml)
+        if tag_id in tag_map:
+            result_parts.append(tag_map[tag_id].original_ph_xml)
         else:
-            # ph_map 中找不到对应标签，保留原文标记（不应发生）
+            # tag_map 中找不到对应标签，保留原文标记（不应发生）
             result_parts.append(m.group(0))
-            print(f"  ⚠️ 警告: tag id='{tag_id}' 在 ph_map 中找不到，保留原文", file=sys.stderr)
+            print(f"  ⚠️ 警告: tag id='{tag_id}' 在 tag_map 中找不到，保留原文", file=sys.stderr)
 
         last_end = m.end()
 
@@ -279,18 +330,22 @@ def _parse_trans_unit(tu_elem) -> TransUnit:
     """解析单个 <trans-unit> 元素"""
     tu_id = tu_elem.get("id", "")
     status = tu_elem.get(f"{{{MQ_NS}}}status", NOT_STARTED)
+    is_locked = (
+        tu_elem.get(f"{{{MQ_NS}}}locked") == "locked"
+        or tu_elem.get("translate") == "no"
+    )
     segment_guid = tu_elem.get(f"{{{MQ_NS}}}segmentguid", "")
     first_label = tu_elem.get(f"{{{MQ_NS}}}firstlabel", "")
 
     # source + 内联标签
     source_elem = tu_elem.find(f"{{{XLIFF_NS}}}source")
-    source_text, ph_map, has_tags = _extract_source_with_tags(source_elem)
+    source_text, tag_map, has_tags = _extract_source_with_tags(source_elem)
 
     # target
     target_elem = tu_elem.find(f"{{{XLIFF_NS}}}target")
     target_text = ""
     if target_elem is not None:
-        target_text = _extract_target_text(target_elem, ph_map)
+        target_text = _extract_target_text(target_elem, tag_map)
 
     # context
     context = ""
@@ -309,12 +364,13 @@ def _parse_trans_unit(tu_elem) -> TransUnit:
     return TransUnit(
         id=tu_id,
         status=status,
+        is_locked=is_locked,
         segment_guid=segment_guid,
         first_label=first_label,
         context=context,
         note=note,
         source_text=source_text,
-        source_ph_map=ph_map,
+        source_tag_map=tag_map,
         target_text=target_text,
         has_inline_tags=has_tags,
     )
@@ -322,17 +378,18 @@ def _parse_trans_unit(tu_elem) -> TransUnit:
 
 def _extract_source_with_tags(source_elem) -> tuple[str, dict[str, InlineTag], bool]:
     """
-    从 <source> 元素提取含 <tag ... /> 的文本和 ph_map。
-    返回 (text, ph_map, has_tags)
+    从 <source> 元素提取含 <tag ... /> 的文本和 tag_map。
+    将 <ph>/<bpt>/<ept> 统一转为 <tag .../> 标记，消除原始 XML 暴露。
+    返回 (text, tag_map, has_tags)
     """
     if source_elem is None:
         return "", {}, False
 
-    ph_map: dict[str, InlineTag] = {}
+    tag_map: dict[str, InlineTag] = {}
     parts = []
     has_tags = False
 
-    # 遍历子节点：文本节点和 <ph> 元素
+    # 元素之前的文本
     if source_elem.text:
         parts.append(source_elem.text)
 
@@ -341,21 +398,34 @@ def _extract_source_with_tags(source_elem) -> tuple[str, dict[str, InlineTag], b
         if tag_name == "ph":
             has_tags = True
             tag = _decode_ph_to_tag(child)
-            ph_map[tag.ph_id] = tag
+            tag_map[tag.ph_id] = tag
+            parts.append(_tag_to_marker(tag))
+        elif tag_name == "bpt":
+            has_tags = True
+            tag = _decode_bpt_ept_to_tag(child, "bpt")
+            tag_map[tag.ph_id] = tag
+            parts.append(_tag_to_marker(tag))
+        elif tag_name == "ept":
+            has_tags = True
+            tag = _decode_bpt_ept_to_tag(child, "ept")
+            # ept 的 id 可能与 bpt 相同，用 id+'_ept' 区分
+            ept_key = f"{tag.ph_id}_ept"
+            tag.ph_id = ept_key
+            tag_map[ept_key] = tag
             parts.append(_tag_to_marker(tag))
         else:
-            # 其他元素（不太会出现，但安全处理）
+            # 理论上不会出现，安全处理
             parts.append(etree.tostring(child, encoding="unicode"))
         if child.tail:
             parts.append(child.tail)
 
-    return "".join(parts), ph_map, has_tags
+    return "".join(parts), tag_map, has_tags
 
 
-def _extract_target_text(target_elem, source_ph_map: dict[str, InlineTag]) -> str:
+def _extract_target_text(target_elem, source_tag_map: dict[str, InlineTag]) -> str:
     """
     从 <target> 元素提取文本（含 tag 标记）。
-    使用 source_ph_map 来解码 target 中的 <ph> 元素（target 的 ph 也应使用相同的映射）。
+    使用 source_tag_map 来解码 target 中的内联元素。
     注意：target 可能为空（NotStarted 状态）。
     """
     if target_elem is None:
@@ -374,11 +444,24 @@ def _extract_target_text(target_elem, source_ph_map: dict[str, InlineTag]) -> st
         tag_name = etree.QName(child).localname
         if tag_name == "ph":
             ph_id = child.get("id", "")
-            if ph_id in source_ph_map:
-                tag = source_ph_map[ph_id]
+            if ph_id in source_tag_map:
+                tag = source_tag_map[ph_id]
             else:
-                # target 中有新的 ph，解码它
                 tag = _decode_ph_to_tag(child)
+            parts.append(_tag_to_marker(tag))
+        elif tag_name == "bpt":
+            bpt_id = child.get("id", "")
+            if bpt_id in source_tag_map:
+                tag = source_tag_map[bpt_id]
+            else:
+                tag = _decode_bpt_ept_to_tag(child, "bpt")
+            parts.append(_tag_to_marker(tag))
+        elif tag_name == "ept":
+            ept_key = f"{child.get('id', '')}_ept"
+            if ept_key in source_tag_map:
+                tag = source_tag_map[ept_key]
+            else:
+                tag = _decode_bpt_ept_to_tag(child, "ept")
             parts.append(_tag_to_marker(tag))
         else:
             parts.append(etree.tostring(child, encoding="unicode"))
@@ -390,7 +473,8 @@ def _extract_target_text(target_elem, source_ph_map: dict[str, InlineTag]) -> st
 
 def _tag_to_marker(tag: InlineTag) -> str:
     """将 InlineTag 转为 <tag id='N' type='T' desc='D'/> 格式"""
-    return f"<tag id='{tag.ph_id}' type='{tag.tag_type}' desc='{tag.desc}'/>"
+    safe_desc = tag.desc.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
+    return f"<tag id='{tag.ph_id}' type='{tag.tag_type}' desc='{safe_desc}'/>"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -424,6 +508,7 @@ def write_translations(
     tu_by_id = {tu.id: tu for tu in trans_units}
 
     updated_count = 0
+    skipped_locked = 0
     for tu_elem in root.iter(f"{{{XLIFF_NS}}}trans-unit"):
         tu_id = tu_elem.get("id", "")
         if tu_id not in translations:
@@ -434,15 +519,20 @@ def write_translations(
         if target_text is None or (isinstance(target_text, str) and not target_text.strip()):
             continue
 
+        # 跳过锁定句段：mq:locked="locked" 或 translate="no"
+        if tu and tu.is_locked:
+            skipped_locked += 1
+            continue
+
         # 更新 target 元素
         target_elem = tu_elem.find(f"{{{XLIFF_NS}}}target")
         if target_elem is None:
             # 不应该出现，但安全处理
             continue
 
-        # 将 <tag ... /> 替换回 <ph>
-        if tu and tu.source_ph_map:
-            ph_content = _replace_tags_with_ph(target_text, tu.source_ph_map)
+        # 将 <tag ... /> 替换回原始 XLIFF 元素
+        if tu and tu.source_tag_map:
+            ph_content = _replace_tags_with_ph(target_text, tu.source_tag_map)
         else:
             ph_content = target_text
 
@@ -454,8 +544,8 @@ def write_translations(
         target_elem.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
         target_elem.tail = target_tail  # 恢复 tail，保持元素间距
 
-        # 如果有 <ph> 元素，需要用 lxml 解析再附加
-        if "<ph " in ph_content:
+        # 如果有 XLIFF 内联元素（ph/bpt/ept），需要用 lxml 解析再附加
+        if any(tag in ph_content for tag in ("<ph ", "<bpt ", "<ept ")):
             _set_target_mixed_content(target_elem, ph_content)
         else:
             target_elem.text = ph_content
@@ -494,6 +584,8 @@ def write_translations(
     output_path.write_bytes(xml_bytes)
 
     print(f"✅ 已写入 {updated_count} 条翻译 → {output_path}")
+    if skipped_locked:
+        print(f"   🔒 跳过 {skipped_locked} 条锁定句段（未覆写）")
     return output_path
 
 
