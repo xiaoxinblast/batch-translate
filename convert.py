@@ -39,6 +39,8 @@ def cmd_parse(args):
         opts["source_col"] = args.source_col
         opts["target_col"] = args.target_col
         opts["header_row"] = args.header_row
+    if getattr(args, "output_dir", None):
+        opts["output_dir"] = args.output_dir
 
     data = parser.parse(filepath, **opts)
     data["_format"] = fmt_name
@@ -71,6 +73,7 @@ def main():
     p_parse = sub.add_parser("parse", help="解析源文件 → 中间 JSON")
     p_parse.add_argument("file", type=str, help="源文件路径")
     p_parse.add_argument("--output", "-o", type=str, default=None, help="输出 JSON 路径")
+    p_parse.add_argument("--output-dir", type=str, default=None, help="mqxliff 导出目录")
     p_parse.add_argument("--source-col", type=str, default="A", help="xlsx 源列（默认 A）")
     p_parse.add_argument("--target-col", type=str, default="B", help="xlsx 目标列（默认 B）")
     p_parse.add_argument("--header-row", type=int, default=1, help="xlsx 表头行号（默认 1）")

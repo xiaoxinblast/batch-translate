@@ -10,7 +10,8 @@ from typing import Optional
 def parse(filepath: Path, **opts) -> dict:
     """调用 mqxliff_tool.py export 生成中间 JSON。"""
     script = Path(__file__).resolve().parent.parent / "mqxliff_tool.py"
-    output_dir = Path(__file__).resolve().parent.parent / "exports"
+    output_dir = opts.get("output_dir") or (Path(__file__).resolve().parent.parent / "exports")
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 构建 export 命令

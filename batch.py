@@ -17,21 +17,40 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
-_STATE_FILE = _SCRIPT_DIR / "data" / "batch_state.json"
+# _STATE_FILE 和 _DEFAULT_EXPORT 现在由 state 中的 stem 决定
+# 保留这些作为 fallback（init 前尚未有 stem 时）
 _DEFAULT_EXPORT = _SCRIPT_DIR / "exports" / "_working.json"
+_ACTIVE_PROJECT = _SCRIPT_DIR / "data" / ".active_project"
+
+
+def _get_state_path() -> Path:
+    """从 .active_project 读取当前 stem，返回 state 文件路径。"""
+    if _ACTIVE_PROJECT.is_file():
+        stem = _ACTIVE_PROJECT.read_text(encoding="utf-8").strip()
+        return _SCRIPT_DIR / "data" / stem / "batch_state.json"
+    # fallback: 旧格式（单文件平铺在 data/ 下）
+    return _SCRIPT_DIR / "data" / "batch_state.json"
+
+
+def _set_active_stem(stem: str):
+    """设置当前活动的项目 stem。"""
+    _ACTIVE_PROJECT.parent.mkdir(parents=True, exist_ok=True)
+    _ACTIVE_PROJECT.write_text(stem, encoding="utf-8")
 
 
 def _load_state() -> dict:
-    if not _STATE_FILE.is_file():
+    state_path = _get_state_path()
+    if not state_path.is_file():
         print("❌ 未初始化，请先运行 init")
         sys.exit(1)
-    with open(_STATE_FILE, "r", encoding="utf-8") as f:
+    with open(state_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def _save_state(state: dict):
-    _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(_STATE_FILE, "w", encoding="utf-8") as f:
+    state_path = _get_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(state_path, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
@@ -151,17 +170,25 @@ def cmd_init(
     header_row: int = 1,
 ):
     """初始化批量翻译：解析源文件 → 中间 JSON，写入 state。"""
-    if _STATE_FILE.is_file():
+    stem = source_path.stem  # 不含扩展名的文件名，用作目录名
+    _set_active_stem(stem)
+
+    state_path = _get_state_path()
+    if state_path.is_file():
         print("⚠️ 状态文件已存在，将覆盖。")
         print("  如需继续之前的任务，请直接运行 next")
 
     # 复制源文件到工作文件（不动源文件）
     import shutil
-    work_file = _SCRIPT_DIR / "data" / f"_working_{source_path.name}"
+    work_dir = _SCRIPT_DIR / "data" / stem
+    work_dir.mkdir(parents=True, exist_ok=True)
+    work_file = work_dir / f"_working_{source_path.name}"
     shutil.copy2(source_path, work_file)
 
     # 用 convert.py 解析
-    export_file = _SCRIPT_DIR / "exports" / "_working.json"
+    export_dir = _SCRIPT_DIR / "exports" / stem
+    export_dir.mkdir(parents=True, exist_ok=True)
+    export_file = export_dir / "_working.json"
     parse_args = [
         sys.executable, str(_SCRIPT_DIR / "convert.py"), "parse",
         str(work_file),
@@ -170,6 +197,8 @@ def cmd_init(
     if source_path.suffix.lower() in (".xlsx", ".xlsm"):
         parse_args += ["--source-col", source_col, "--target-col", target_col,
                        "--header-row", str(header_row)]
+    if source_path.suffix.lower() == ".mqxliff":
+        parse_args += ["--output-dir", str(export_dir)]
 
     import subprocess
     subprocess.run(parse_args, check=True)
@@ -206,6 +235,7 @@ def cmd_init(
     document_summary = _generate_summary(entries, batches, batch_chars)
 
     state = {
+        "stem": stem,
         "source_file": str(work_file.resolve()),
         "source_format": data.get("_format", source_path.suffix.lower().lstrip(".")),
         "export_file": str(export_file.resolve()),
@@ -278,7 +308,7 @@ def cmd_next(review_only: bool = False):
 
     if review_only:
         # ── 校对模式：直接生成 review JSON（跳过翻译） ──
-        out_path = _SCRIPT_DIR / "exports" / f"_batch_{batch_num:03d}_to_review.json"
+        out_path = _SCRIPT_DIR / "exports" / state["stem"] / f"_batch_{batch_num:03d}_to_review.json"
         review = {}
         review["instructions"] = (
             "逐条核对译文与原文：1)术语是否准确统一 2)标点格式是否符合规范 "
@@ -361,7 +391,7 @@ def cmd_next(review_only: bool = False):
     batch["total_batches"] = state["total_batches"]
     batch["entries"] = batch_entries
 
-    out_path = _SCRIPT_DIR / "exports" / f"_batch_{batch_num:03d}_to_translate.json"
+    out_path = _SCRIPT_DIR / "exports" / state["stem"] / f"_batch_{batch_num:03d}_to_translate.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(batch, f, ensure_ascii=False, indent=2)
 
@@ -380,6 +410,7 @@ def cmd_next(review_only: bool = False):
 def cmd_submit(result_path: Path):
     """合并 AI 翻译结果，写回 mqxliff，推进到下一批。"""
     state = _load_state()
+    state_path = _get_state_path()
 
     if not result_path.is_file():
         print(f"❌ 结果文件不存在: {result_path}")
@@ -441,7 +472,7 @@ def cmd_submit(result_path: Path):
             _accumulate_tm(export_file, tm_path)
 
     # 重新 parse（TM 已更新，获取最新 matches）
-    reexport_file = _SCRIPT_DIR / "exports" / "_working.json"
+    reexport_file = _SCRIPT_DIR / "exports" / state["stem"] / "_working.json"
     parse_args = [
         sys.executable, str(_SCRIPT_DIR / "convert.py"), "parse",
         str(work_file),
@@ -460,7 +491,7 @@ def cmd_submit(result_path: Path):
     if state["current_batch"] >= len(state["batches"]):
         print()
         print("🎉 全部翻译完成！")
-        _STATE_FILE.unlink(missing_ok=True)
+        state_path.unlink(missing_ok=True)
         return
 
     # 自动输出下一批
@@ -478,7 +509,7 @@ def cmd_review(result_path: Path):
 
     # 读取当前批的翻译任务 JSON
     batch_num = state["current_batch"] + 1
-    batch_file = _SCRIPT_DIR / "exports" / f"_batch_{batch_num:03d}_to_translate.json"
+    batch_file = _SCRIPT_DIR / "exports" / state["stem"] / f"_batch_{batch_num:03d}_to_translate.json"
     if not batch_file.is_file():
         print(f"❌ 找不到翻译任务文件: {batch_file.name}")
         sys.exit(1)
@@ -518,7 +549,7 @@ def cmd_review(result_path: Path):
         entries_with_translation.append(entry)
     review["entries"] = entries_with_translation
 
-    out_path = _SCRIPT_DIR / "exports" / f"_batch_{batch_num:03d}_to_review.json"
+    out_path = _SCRIPT_DIR / "exports" / state["stem"] / f"_batch_{batch_num:03d}_to_review.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(review, f, ensure_ascii=False, indent=2)
 
@@ -536,7 +567,8 @@ def cmd_review(result_path: Path):
 
 def cmd_status():
     """显示当前进度。"""
-    if not _STATE_FILE.is_file():
+    state_path = _get_state_path()
+    if not state_path.is_file():
         print("未初始化。运行 init 开始。")
         return
 
