@@ -153,9 +153,12 @@ def _generate_summary(entries: list, batches: list, batch_chars: int) -> str:
         "",
         "上下文分布:",
     ]
-    for prefix, count in sorted(ctx_groups.items(), key=lambda x: -x[1]):
+    sorted_ctx = sorted(ctx_groups.items(), key=lambda x: -x[1])
+    for prefix, count in sorted_ctx[:10]:
         pct = count / total * 100
         lines.append(f"  {prefix}: {count} 条 ({pct:.0f}%)")
+    if len(sorted_ctx) > 10:
+        lines.append(f"  … 其余 {len(sorted_ctx) - 10} 个上下文分组")
 
     return "\n".join(lines)
 
