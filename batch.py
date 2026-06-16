@@ -90,7 +90,7 @@ def _enrich_working_json(json_path: Path, state: dict):
             tb = TermBase(terms_path)
             tb.load()
             import re
-            tr = re.compile(r"<tag[^>]*/>")
+            tr = re.compile(r"<[^>]+>")
             for e in data.get("entries", []):
                 plain = tr.sub("", e.get("source", ""))
                 terms = tb.find_terms(plain)
@@ -106,7 +106,7 @@ def _enrich_working_json(json_path: Path, state: dict):
             from tm_store import TranslationMemory
             tm = TranslationMemory(tm_path)
             import re
-            tr = re.compile(r"<tag[^>]*/>")
+            tr = re.compile(r"<[^>]+>")
             for e in data.get("entries", []):
                 plain = tr.sub("", e.get("source", ""))
                 matches = tm.find_matches(plain)
@@ -122,7 +122,7 @@ def _enrich_working_json(json_path: Path, state: dict):
 def _generate_summary(entries: list, batches: list, batch_chars: int) -> str:
     """生成文档结构摘要。"""
     import re
-    _tag_re = re.compile(r"<tag[^>]*/>")
+    _tag_re = re.compile(r"<[^>]+>")
 
     total = len(entries)
     total_chars = sum(len(_tag_re.sub("", e["source"])) for e in entries)
@@ -207,7 +207,7 @@ def cmd_init(
 
     # 按字数分批
     import re
-    _tag_re = re.compile(r"<tag[^>]*/>")
+    _tag_re = re.compile(r"<[^>]+>")
     batches = []
     start = 0
     cum = 0
