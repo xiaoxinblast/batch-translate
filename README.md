@@ -1,84 +1,51 @@
 # batch-translate — 批量翻译工作流
 
-支持 mqxliff / docx / xlsx / txt 文件的批量翻译 + 校对，全自动循环。
-
-## 快速开始
-
-```bash
-# 1. 编辑项目模板
-#    data/style_guide.txt — 项目翻译规范（共享）
-#    data/term_base.xlsx — 术语表（原文 | 译文 | 注释）（共享）
-
-# 2. 初始化（自动检测格式，按源文件 stem 分目录）
-#    data/<stem>/ — 项目状态和工作文件
-#    exports/<stem>/ — 批次 JSON 输出
-python batch_translate/batch.py init <文件> \
-  --batch-chars 3000 --context-size 5 \
-  --terms batch_translate/data/term_base.xlsx \
-  --tm batch_translate/data/tm_memory.json \
-  --style-guide batch_translate/data/style_guide.txt
-
-# 3. （可选）派 Agent 全量分析语境，结果存入 state
-# 4. 获取第一批
-python batch_translate/batch.py next
-
-# 5. 翻译 → 校对 → 提交（循环）
-python batch_translate/batch.py review <翻译结果.json>
-python batch_translate/batch.py submit <校对结果.json>
-
-# 仅校对模式（文件已有译文）
-python batch_translate/batch.py next --review
-```
-
-## 工作流
-
-```
-源文件 → parse → init（统计摘要） → Agent 全量语境分析 → 分批
-                                                           │
-                                              翻译 → 校对 → submit → 循环
-```
-
-每批步骤：
-
-| 步骤 | 命令 | 说明 |
-|------|------|------|
-| 分析 | Agent 读 `_working.json` | 全量语境分析（跨区域关联、叙事脉络） |
-| 分发 | `batch.py next` | 含 document_summary + style_guide |
-| 翻译 | AI Agent（opus） | 含 terms + tm_matches |
-| 校对 | `batch.py review` | source + translated 对照 |
-| 检查 | AI Agent（opus） | 修正术语/标点/语气/流畅度 |
-| 提交 | `batch.py submit` | write + TM + 下一批 |
+配合 Claude Code Skill 使用的批量翻译工具，支持 日→中 翻译 + 校对 全自动循环。
 
 ## 支持格式
 
-| 格式 | 扩展名 | 说明 |
-|------|--------|------|
-| mqxliff | `.mqxliff` | MemoQ XLIFF（完整支持内联标签、状态管理） |
-| docx | `.docx` | Word 文档（段落+表格，保留粗体/斜体标记） |
-| xlsx | `.xlsx/.xlsm` | Excel（指定源/目标列，保留同行上下文） |
-| txt | `.txt/.csv/.tsv` | 纯文本（按行解析，自动检测编码） |
+mqxliff（MemoQ） · docx · xlsx · txt · csv · tsv
 
-## 文件说明
+## 快速开始
+
+**前置：** 安装 Claude Code Skill（`batch-translate`），然后对 Claude 说：
+
+> "开始批量翻译"
+
+Claude 会自动完成：初始化 → 语境分析 → 翻译 → 校对 → 写回，全部自动化。
+
+## 手动使用
+
+```bash
+# 1. 初始化（自动检测格式）
+python batch_translate/batch.py init <源文件> --batch-chars 6000
+
+# 2. 获取当前批次
+python batch_translate/batch.py next
+
+# 3. 翻译后校对
+python batch_translate/batch.py review <翻译结果.json>
+
+# 4. 提交并推进到下一批
+python batch_translate/batch.py submit <校对结果.json>
+
+# 其他
+python batch_translate/batch.py status    # 查看进度
+python batch_translate/batch.py next --review  # 仅校对模式（已有译文）
+```
+
+## 项目文件
 
 | 文件 | 用途 |
 |------|------|
-| `batch.py` | 工作流编排（init/next/review/submit/status） |
-| `convert.py` | 格式转换层（parse → 中间 JSON，write → 原格式） |
-| `mqxliff_tool.py` | mqxliff 解析/导出/写回（含内联标签、TM） |
-| `term_base.py` | 术语库 xlsx 加载 + 贪婪最长匹配 |
-| `tm_store.py` | 翻译记忆 JSON 存储 + difflib 模糊检索 |
-| `parsers/` | 各格式 parser（txt/xlsx/docx/mqxliff） |
-| `data/` | 项目数据：`<stem>/` 独立项目文件，根目录共享术语/风格/记忆 |
-| `exports/` | 工作输出：`<stem>/` 独立批次文件 |
+| `data/style_guide.txt` | 翻译风格指南（共享） |
+| `data/term_base.xlsx` | 术语表：原文(ja) / 译文(zh) / 注释（共享） |
+| `data/tm_memory.json` | 翻译记忆（共享，自动积累） |
+| `data/<项目>/` | 工作文件和状态（自动生成） |
+| `exports/<项目>/` | 批次 JSON（自动生成） |
 
 ## 依赖
 
 ```bash
 pip install lxml openpyxl python-docx
 ```
-
-## Claude Code Skill
-
-将 `batch-translate` Skill 安装到 `~/.claude/skills/` 后：
-
-> "开始批量翻译" → 自动初始化 + 翻译 + 校对 + 循环直到完成
