@@ -6,10 +6,12 @@
 
 ```bash
 # 1. 编辑项目模板
-#    data/style_guide.txt — 项目翻译规范
-#    data/term_base.xlsx — 术语表（原文 | 译文 | 注释）
+#    data/style_guide.txt — 项目翻译规范（共享）
+#    data/term_base.xlsx — 术语表（原文 | 译文 | 注释）（共享）
 
-# 2. 初始化（自动检测格式 + 生成文档结构摘要）
+# 2. 初始化（自动检测格式，按源文件 stem 分目录）
+#    data/<stem>/ — 项目状态和工作文件
+#    exports/<stem>/ — 批次 JSON 输出
 python batch_translate/batch.py init <文件> \
   --batch-chars 3000 --context-size 5 \
   --terms batch_translate/data/term_base.xlsx \
@@ -66,8 +68,8 @@ python batch_translate/batch.py next --review
 | `term_base.py` | 术语库 xlsx 加载 + 贪婪最长匹配 |
 | `tm_store.py` | 翻译记忆 JSON 存储 + difflib 模糊检索 |
 | `parsers/` | 各格式 parser（txt/xlsx/docx/mqxliff） |
-| `data/` | 项目数据（指南、术语、记忆） |
-| `exports/` | 工作文件输出 |
+| `data/` | 项目数据：`<stem>/` 独立项目文件，根目录共享术语/风格/记忆 |
+| `exports/` | 工作输出：`<stem>/` 独立批次文件 |
 
 ## 依赖
 
