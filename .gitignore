@@ -5,3 +5,8 @@ data/_working_*
 data/tm_memory.json
 exports/*
 !exports/.gitkeep
+data/style_guide.txt
+data/term_base.xlsx
+data/tm_memory.json
+data/batch_state.json
+data/_working_*
