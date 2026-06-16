@@ -564,7 +564,7 @@ def export_to_json(
     output_path = output_dir / f"{Path(filepath).stem}.json"
 
     # 提取纯文本版本的 source 用于匹配（去掉 tag 标记）
-    _tag_strip_re = re.compile(r"<tag[^>]*/>")
+    _tag_strip_re = re.compile(r"<[^>]+>")
 
     records = []
     terms_total = 0
@@ -645,7 +645,7 @@ def import_from_json(
     entries = data.get("entries", [])
     source_file_name = data.get("source_file", str(Path(mqxliff_path).name))
 
-    _tag_strip_re = re.compile(r"<tag[^>]*/>")
+    _tag_strip_re = re.compile(r"<[^>]+>")
 
     translations = {}
     tm_new_entries = []

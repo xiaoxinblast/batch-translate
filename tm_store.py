@@ -63,7 +63,7 @@ class TranslationMemory:
 
     # ── 模糊检索 ──────────────────────────────────────────────────
 
-    _tag_re = re.compile(r"<tag[^>]*/>")
+    _tag_re = re.compile(r"<[^>]+>")
 
     def find_matches(
         self, source: str, threshold: float = 0.6, top_n: int = 3
