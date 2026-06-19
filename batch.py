@@ -123,7 +123,7 @@ def _enrich_working_json(json_path: Path, state: dict):
             tr = re.compile(r"<[^>]+>")
             for e in data.get("entries", []):
                 plain = tr.sub("", e.get("source", ""))
-                matches = tm.find_matches(plain)
+                matches = tm.find_matches(plain, query_context=e.get("context", ""))
                 if matches:
                     e["tm_matches"] = matches
         except ImportError:
@@ -147,6 +147,55 @@ def _generate_summary(entries: list, batches: list, batch_chars: int) -> str:
         f"总条目: {total}  纯文本字数: {total_chars}  批次: {len(batches)}（每批 ~{batch_chars} 字）\n"
         f"内联标签: {has_tags} 条  已有译文: {has_target} 条"
     )
+
+
+def _build_review_json(
+    entries: list[dict],
+    state: dict,
+    *,
+    style_guide: str = "",
+    previous: list[dict] | None = None,
+    batch_num: int = 1,
+    review_only: bool = False,
+) -> dict:
+    """构建校对 JSON。entries 每条需含 id/source/translated。"""
+    review: dict = {}
+    review["instructions"] = (
+        "逐条核对译文与原文：1)术语是否准确统一 2)标点格式是否符合规范 "
+        "3)语气是否符合角色 4)表达是否自然流畅、无翻译腔。"
+        + (
+            "每条 entry 可能带有 tm_matches（翻译记忆参考）和 terms（术语约束），核对时参考。"
+            "内联标签（<tag .../>）必须原样保留，数量与位置与 source 一致——丢失标签是最严重的错误。"
+        )
+        + ("发现问题直接修正，无需标注。" if review_only else "")
+    )
+    if state.get("document_summary"):
+        review["document_summary"] = state["document_summary"]
+    if style_guide:
+        review["style_guide"] = style_guide
+    if previous:
+        review["previous"] = previous
+    review["batch"] = batch_num
+    review["total_batches"] = state["total_batches"]
+
+    review_entries = []
+    for e in entries:
+        item = {
+            "id": e["id"],
+            "source": e["source"],
+            "translated": e.get("translated", e.get("target", "")),
+        }
+        if e.get("context"):
+            item["context"] = e["context"]
+        if e.get("note"):
+            item["note"] = e["note"]
+        if e.get("terms"):
+            item["terms"] = e["terms"]
+        if e.get("tm_matches"):
+            item["tm_matches"] = e["tm_matches"]
+        review_entries.append(item)
+    review["entries"] = review_entries
+    return review
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -247,6 +296,9 @@ def cmd_init(
     }
     _save_state(state)
 
+    # 术语/TM 增强（即使 TM 为空也做术语匹配；跨文件 TM 可复用）
+    _enrich_working_json(export_file, state)
+
     # 显示分批信息
     avg = sum(e - s for s, e in batches) / total_batches
     print(f"✅ 初始化完成")
@@ -303,48 +355,23 @@ def cmd_next(review_only: bool = False):
 
     if review_only:
         # ── 校对模式：直接生成 review JSON（跳过翻译） ──
-        out_path = _SCRIPT_DIR / "exports" / state["stem"] / f"_batch_{batch_num:03d}_to_review.json"
-        review = {}
-        review["instructions"] = (
-            "逐条核对译文与原文：1)术语是否准确统一 2)标点格式是否符合规范 "
-            "3)语气是否符合角色 4)表达是否自然流畅、无翻译腔。"
-            "发现问题直接修正，无需标注。"
+        review = _build_review_json(
+            entries[start:end],
+            state,
+            style_guide=data.get("style_guide", ""),
+            previous=context_entries or None,
+            batch_num=batch_num,
+            review_only=True,
         )
-        if state.get("document_summary"):
-            review["document_summary"] = state["document_summary"]
-        if data.get("style_guide"):
-            review["style_guide"] = data["style_guide"]
-        if context_entries:
-            review["previous"] = context_entries
-        review["batch"] = batch_num
-        review["total_batches"] = state["total_batches"]
-
-        review_entries = []
-        for e in entries[start:end]:
-            item = {
-                "id": e["id"],
-                "source": e["source"],
-                "translated": e.get("target", ""),
-            }
-            if e.get("context"):
-                item["context"] = e["context"]
-            if e.get("note"):
-                item["note"] = e["note"]
-            if e.get("terms"):
-                item["terms"] = e["terms"]
-            if e.get("tm_matches"):
-                item["tm_matches"] = e["tm_matches"]
-            review_entries.append(item)
-        review["entries"] = review_entries
-
+        out_path = _SCRIPT_DIR / "exports" / state["stem"] / f"_batch_{batch_num:03d}_to_review.json"
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(review, f, ensure_ascii=False, indent=2)
 
-        existing = sum(1 for e in review_entries if e["translated"])
+        existing = sum(1 for e in review["entries"] if e["translated"])
         print(f"📝 Batch {batch_num}/{state['total_batches']}  条目 {start + 1}-{end}（共 {total} 条）")
         print(f"   模式: 校对（跳过翻译）")
         print(f"   输出: {out_path.name}")
-        print(f"   其中 {existing}/{len(review_entries)} 条已有译文")
+        print(f"   其中 {existing}/{len(review['entries'])} 条已有译文")
         if context_entries:
             print(f"   上文: {len(context_entries)} 条")
         print(f"   校对后请将修正结果保存为 JSON，运行:")
@@ -374,6 +401,9 @@ def cmd_next(review_only: bool = False):
     batch["instructions"] = (
         "翻译过程中遇到任何不确定的术语、专有名词、角色名、上下文含义时，"
         "不要猜测，应主动搜索项目文件或联网搜索以获取准确信息后，再给出确定译文。"
+        "每条 entry 可能带有 tm_matches（翻译记忆模糊匹配，高相似度可直接复用）"
+        "和 terms（术语库匹配），翻译时优先参考。"
+        "原文中的 <tag .../> 内联标签必须原样保留在译文中，数量和位置不变。"
         "最终返回结果必须是干净的译文，不要附加任何标注或说明。"
     )
     if state.get("document_summary"):
@@ -422,10 +452,11 @@ def cmd_submit(result_path: Path):
     result_map = {str(r["id"]): r["target"] for r in results}
     print(f"📥 读取到 {len(result_map)} 条翻译")
 
-    # 合并到 export JSON
+    # 合并到 export JSON（先备份，失败时恢复）
     export_file = Path(state["export_file"])
     with open(export_file, "r", encoding="utf-8") as f:
         data = json.load(f)
+    backup_data = json.dumps(data, ensure_ascii=False)  # 回滚用
 
     merged = 0
     for e in data["entries"]:
@@ -442,41 +473,49 @@ def cmd_submit(result_path: Path):
     work_file = Path(state["source_file"])
     tm_path = state.get("tm_path")
 
-    if state["source_format"] == "mqxliff":
-        # mqxliff: 用 mqxliff_tool.py import（含 TM 积累）
-        import_args = [
-            sys.executable, str(_SCRIPT_DIR / "mqxliff_tool.py"), "import",
-            str(export_file),
-            str(work_file),
-            "--output", str(work_file),
-        ]
-        if tm_path:
-            import_args += ["--save-tm", str(tm_path)]
-        subprocess.run(import_args, check=True)
-    else:
-        # 其他格式: convert.py write
-        write_args = [
-            sys.executable, str(_SCRIPT_DIR / "convert.py"), "write",
-            str(work_file),
-            str(export_file),
-            "--output", str(work_file),
-        ]
-        subprocess.run(write_args, check=True)
-        # TM 积累：追加翻译到 tm_memory.json
-        if tm_path:
-            _accumulate_tm(export_file, tm_path)
+    try:
+        if state["source_format"] == "mqxliff":
+            # mqxliff: 用 mqxliff_tool.py import（含 TM 积累）
+            import_args = [
+                sys.executable, str(_SCRIPT_DIR / "mqxliff_tool.py"), "import",
+                str(export_file),
+                str(work_file),
+                "--output", str(work_file),
+            ]
+            if tm_path:
+                import_args += ["--save-tm", str(tm_path)]
+            subprocess.run(import_args, check=True)
+        else:
+            # 其他格式: convert.py write
+            write_args = [
+                sys.executable, str(_SCRIPT_DIR / "convert.py"), "write",
+                str(work_file),
+                str(export_file),
+                "--output", str(work_file),
+            ]
+            subprocess.run(write_args, check=True)
+            # TM 积累：追加翻译到 tm_memory.json
+            if tm_path:
+                _accumulate_tm(export_file, tm_path)
 
-    # 重新 parse（TM 已更新，获取最新 matches）
-    reexport_file = _SCRIPT_DIR / "exports" / state["stem"] / "_working.json"
-    parse_args = [
-        sys.executable, str(_SCRIPT_DIR / "convert.py"), "parse",
-        str(work_file),
-        "--output", str(reexport_file),
-    ]
-    subprocess.run(parse_args, check=True)
+        # 重新 parse（TM 已更新，获取最新 matches）
+        reexport_file = _SCRIPT_DIR / "exports" / state["stem"] / "_working.json"
+        parse_args = [
+            sys.executable, str(_SCRIPT_DIR / "convert.py"), "parse",
+            str(work_file),
+            "--output", str(reexport_file),
+        ]
+        subprocess.run(parse_args, check=True)
 
-    # 对工作 JSON 做术语/TM/风格指南增强
-    _enrich_working_json(reexport_file, state)
+        # 对工作 JSON 做术语/TM/风格指南增强
+        _enrich_working_json(reexport_file, state)
+
+    except Exception:
+        # 回滚：恢复 _working.json，状态不变
+        with open(export_file, "w", encoding="utf-8") as f:
+            f.write(backup_data)
+        print("❌ 提交失败，已回滚 _working.json，状态未推进，可安全重试。")
+        raise
 
     # 推进状态
     state["current_batch"] += 1
@@ -521,36 +560,28 @@ def cmd_review(result_path: Path):
     result_map = {str(r["id"]): r["target"] for r in results}
 
     # 构建校对 JSON
-    review = {}
-    review["instructions"] = (
-        "逐条核对译文与原文：1)术语是否准确统一 2)标点格式是否符合规范 "
-        "3)语气是否符合角色 4)表达是否自然流畅、无翻译腔。"
-        "对不确定的术语或译法，主动搜索项目文件或联网验证后再修正。"
-        "发现问题直接修正，无需标注。"
-    )
-    if state.get("document_summary"):
-        review["document_summary"] = state["document_summary"]
-    if batch_data.get("style_guide"):
-        review["style_guide"] = batch_data["style_guide"]
-    if batch_data.get("previous"):
-        review["previous"] = batch_data["previous"]
-    review["batch"] = batch_data["batch"]
-    review["total_batches"] = batch_data["total_batches"]
-
-    entries_with_translation = []
+    merged = []
     for e in batch_data["entries"]:
         entry = dict(e)
         entry["translated"] = result_map.get(e["id"], "")
-        entries_with_translation.append(entry)
-    review["entries"] = entries_with_translation
+        merged.append(entry)
+
+    review = _build_review_json(
+        merged,
+        state,
+        style_guide=batch_data.get("style_guide", ""),
+        previous=batch_data.get("previous"),
+        batch_num=batch_data["batch"],
+        review_only=False,
+    )
 
     out_path = _SCRIPT_DIR / "exports" / state["stem"] / f"_batch_{batch_num:03d}_to_review.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(review, f, ensure_ascii=False, indent=2)
 
     print(f"📝 校对文件已生成: {out_path.name}")
-    print(f"   共 {len(entries_with_translation)} 条待校对")
-    translated_count = sum(1 for e in entries_with_translation if e["translated"])
+    print(f"   共 {len(merged)} 条待校对")
+    translated_count = sum(1 for e in merged if e["translated"])
     print(f"   其中 {translated_count} 条已有译文")
     print(f"   校对后请将修正结果保存为 JSON，运行:")
     print(f"   python batch_translate/batch.py submit <reviewed.json>")
@@ -585,6 +616,20 @@ def cmd_status():
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# retry
+# ═══════════════════════════════════════════════════════════════════════
+
+def cmd_retry():
+    """重新生成当前批次的翻译 JSON（用于 Agent 输出格式错误后重试）。"""
+    state = _load_state()
+    if state["current_batch"] >= len(state["batches"]):
+        print("✅ 全部已完成，无需重试。")
+        return
+    print("🔄 重新生成当前批次...")
+    cmd_next()
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -610,6 +655,7 @@ def main():
     p_submit = sub.add_parser("submit", help="提交校对结果并推进")
     p_submit.add_argument("result", type=str, help="校对后的结果 JSON 路径")
     p_status = sub.add_parser("status", help="查看进度")
+    p_retry = sub.add_parser("retry", help="重新生成当前批次翻译 JSON")
 
     args = parser.parse_args()
 
@@ -633,6 +679,8 @@ def main():
         cmd_submit(Path(args.result))
     elif args.command == "status":
         cmd_status()
+    elif args.command == "retry":
+        cmd_retry()
     else:
         parser.print_help()
 

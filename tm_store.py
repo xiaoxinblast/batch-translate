@@ -45,19 +45,20 @@ class TranslationMemory:
     # ── 增删 ──────────────────────────────────────────────────────
 
     def add(self, entries: list[dict], dedup: bool = True):
-        """追加条目。dedup=True 时按 source 去重。"""
+        """追加条目。dedup=True 时按 (source, context) 去重。"""
         self.load()
         if dedup:
-            existing_sources = {e["source"] for e in self._entries}
+            existing_keys = {(e["source"], e.get("context", "")) for e in self._entries}
             for entry in entries:
-                if entry.get("source", "").strip() not in existing_sources:
+                key = (entry.get("source", "").strip(), entry.get("context", "").strip())
+                if key not in existing_keys:
                     self._entries.append({
                         "source": entry.get("source", ""),
                         "target": entry.get("target", ""),
                         "context": entry.get("context", ""),
                         "file": entry.get("file", ""),
                     })
-                    existing_sources.add(entry["source"])
+                    existing_keys.add(key)
         else:
             self._entries.extend(entries)
 
@@ -66,12 +67,13 @@ class TranslationMemory:
     _tag_re = re.compile(r"<[^>]+>")
 
     def find_matches(
-        self, source: str, threshold: float = 0.6, top_n: int = 3
+        self, source: str, threshold: float = 0.6, top_n: int = 3,
+        query_context: str = "",
     ) -> list[dict]:
         """
         返回与 source 相似度 >= threshold 的前 top_n 条匹配。
         内部用去 tag 纯文本做模糊比对，返回保留完整 tag 的 source/target。
-        结果按相似度降序排列。
+        结果按相似度降序排列；相似度相同时 context 前缀匹配的条目优先。
         """
         self.load()
         if not self._entries or not source:
@@ -79,6 +81,20 @@ class TranslationMemory:
 
         # 比对用纯文本
         query_plain = self._tag_re.sub("", source)
+
+        def _ctx_score(ctx: str) -> int:
+            """context 逐段（. 分隔）前缀匹配段数。"""
+            if not query_context or not ctx:
+                return 0
+            q_parts = query_context.split(".")
+            c_parts = ctx.split(".")
+            n = 0
+            for q, c in zip(q_parts, c_parts):
+                if q == c:
+                    n += 1
+                else:
+                    break
+            return n
 
         scored = []
         matcher = SequenceMatcher(a=query_plain)
@@ -91,9 +107,13 @@ class TranslationMemory:
                     "source": entry["source"],     # 含 tag 的完整版
                     "target": entry["target"],     # 含 tag 的完整版
                     "similarity": round(ratio, 4),
+                    "context": entry.get("context", ""),
+                    "_ctx": _ctx_score(entry.get("context", "")),
                 })
 
-        scored.sort(key=lambda x: -x["similarity"])
+        scored.sort(key=lambda x: (-x["similarity"], -x["_ctx"]))
+        for s in scored:
+            del s["_ctx"]
         return scored[:top_n]
 
     def __len__(self) -> int:
