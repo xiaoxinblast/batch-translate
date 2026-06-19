@@ -95,13 +95,8 @@ def _enrich_working_json(json_path: Path, state: dict):
         if sg.is_file():
             data["style_guide"] = sg.read_text(encoding="utf-8")
 
-    if state["source_format"] == "mqxliff":
-        # TM/terms 由 mqxliff_tool.py export 已做，只需补 style_guide
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        return
-
-    # terms
+    # terms（所有格式统一处理，包括 mqxliff；init 时 TM 为空，
+    # submit 后重导出也不带 TM，因此必须在此补做）
     terms_path = state.get("terms_path")
     if terms_path:
         try:
