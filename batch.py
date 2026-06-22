@@ -443,7 +443,26 @@ def cmd_submit(result_path: Path):
 
     # 读取 AI 结果
     with open(result_path, "r", encoding="utf-8") as f:
-        results = json.load(f)
+        try:
+            results = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"❌ JSON 解析失败: {e}")
+            # 诊断常见问题
+            import re
+            f.seek(0)
+            content = f.read()
+            # 检测中文语境下的 ASCII 引号（U+0022 冒充中文引号）
+            suspicious = re.findall(r'[一-鿿　-〿]"[一-鿿]', content)
+            if suspicious:
+                print(f"   ⚠️ 发现 {len(suspicious)} 处中文引号误用 ASCII 引号 (U+0022)")
+                print(f"   示例: {suspicious[:3]}")
+                print(f"   修复方法: 将中文语境下的 \" 替换为弯引号 “ / ”")
+            # 检测字面 tab 字符
+            if '\t' in content:
+                lines_with_tab = [i+1 for i, line in enumerate(content.split('\n')) if '\t' in line]
+                if len(lines_with_tab) <= 5:
+                    print(f"   ⚠️ 文件中含字面 tab 字符，行号: {lines_with_tab}")
+            sys.exit(1)
 
     if not isinstance(results, list):
         print("❌ 结果格式错误：应为 JSON 数组 [{id, target}, ...]")
