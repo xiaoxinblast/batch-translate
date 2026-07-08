@@ -432,6 +432,79 @@ def cmd_next(review_only: bool = False):
 # submit
 # ═══════════════════════════════════════════════════════════════════════
 
+def _validate_submission(results: list, state: dict) -> None:
+    """提交前分级校验：致命错误退出（不写回、不推进），非致命仅警告。
+
+    致命：缺 id/target 字段、重复 id、本批预期 id 未全覆盖。
+    警告：内联标签数与 source 不一致、target 为空但 source 有可译文本、
+          提交了不属于本批的 id。
+    """
+    import re
+    from collections import Counter
+
+    export_file = Path(state["export_file"])
+    with open(export_file, "r", encoding="utf-8") as f:
+        export_data = json.load(f)
+    start, end = state["batches"][state["current_batch"]]
+    batch_entries = export_data["entries"][start:end]
+    expected_ids = {str(e["id"]) for e in batch_entries}
+    source_by_id = {str(e["id"]): e.get("source", "") for e in batch_entries}
+
+    # ── 致命：字段完整性 ──
+    for i, r in enumerate(results):
+        if not isinstance(r, dict) or "id" not in r:
+            print(f"❌ 校验失败：第 {i} 条缺少 'id' 字段，未写回、状态未推进")
+            sys.exit(1)
+        if "target" not in r:
+            print(f"❌ 校验失败：id={r.get('id')} 缺少 'target' 字段，未写回、状态未推进")
+            sys.exit(1)
+
+    submitted_ids = [str(r["id"]) for r in results]
+
+    # ── 致命：重复 id ──
+    dupes = [i for i, c in Counter(submitted_ids).items() if c > 1]
+    if dupes:
+        print(f"❌ 校验失败：结果含重复 id（{len(dupes)} 个）：{sorted(dupes)[:20]}")
+        print("   → 未写回、状态未推进，可修正后重新 submit。")
+        sys.exit(1)
+
+    # ── 致命：本批预期 id 未全覆盖 ──
+    submitted_set = set(submitted_ids)
+    missing = expected_ids - submitted_set
+    if missing:
+        print(f"❌ 校验失败：缺少本批 {len(missing)}/{len(expected_ids)} 条译文"
+              f"（提交 {len(submitted_set)} 条，可能只提交了改动条）")
+        print(f"   缺失 id（前 20）：{sorted(missing)[:20]}")
+        print("   → 未写回、状态未推进，请补全全部条目后重新 submit。")
+        sys.exit(1)
+
+    # ── 警告：不属于本批的 id ──
+    extra = submitted_set - expected_ids
+    if extra:
+        print(f"⚠️ 警告：{len(extra)} 条 id 不属于本批（将按 id 匹配写到对应条目，"
+              f"请确认无误）：{sorted(extra)[:20]}")
+
+    # ── 警告：标签数 / 空 target ──
+    TAG_RE = re.compile(r"<tag\s+id=['\"][^'\"]+['\"].*?/>")
+    STRIP_TAG = re.compile(r"<[^>]+>")
+    tag_warn, empty_warn = [], []
+    for r in results:
+        rid = str(r["id"])
+        target = r.get("target") or ""
+        source = source_by_id.get(rid, "")
+        if "<tag" in source and len(TAG_RE.findall(source)) != len(TAG_RE.findall(target)):
+            tag_warn.append(rid)
+        if not target.strip() and STRIP_TAG.sub("", source).strip():
+            empty_warn.append(rid)
+    if tag_warn:
+        print(f"⚠️ 警告：{len(tag_warn)} 条内联标签数与 source 不一致：{tag_warn[:20]}")
+    if empty_warn:
+        print(f"⚠️ 警告：{len(empty_warn)} 条 target 为空但 source 含可译文本：{empty_warn[:20]}")
+
+    tail = "（含警告，见上）" if (extra or tag_warn or empty_warn) else ""
+    print(f"✅ 提交校验通过：{len(results)} 条，本批 id 全覆盖{tail}")
+
+
 def cmd_submit(result_path: Path):
     """合并 AI 翻译结果，写回 mqxliff，推进到下一批。"""
     state = _load_state()
@@ -467,6 +540,9 @@ def cmd_submit(result_path: Path):
     if not isinstance(results, list):
         print("❌ 结果格式错误：应为 JSON 数组 [{id, target}, ...]")
         sys.exit(1)
+
+    # 提交前分级校验（致命错误退出、不写回、不推进）
+    _validate_submission(results, state)
 
     result_map = {str(r["id"]): r["target"] for r in results}
     print(f"📥 读取到 {len(result_map)} 条翻译")
