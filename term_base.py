@@ -60,13 +60,14 @@ class TermBase:
     # ── 匹配 ──────────────────────────────────────────────────────
 
     def find_terms(self, text: str) -> list[dict]:
-        """在 text 中查找所有匹配的术语，贪婪最长匹配。"""
+        """在 text 中查找所有匹配的术语，贪婪最长匹配。
+        同源文位置允许多个不同译文共存。"""
         if not self._loaded:
             self.load()
         if not self._terms or not text:
             return []
 
-        matched_indices: set[int] = set()  # 已匹配的字符位置
+        matched_spans: dict[tuple[int, str], list[dict]] = {}  # (pos, ja) → matches
         results: list[dict] = []
 
         for term in self._terms:
@@ -76,15 +77,23 @@ class TermBase:
                 idx = text.find(ja, pos)
                 if idx == -1:
                     break
-                # 检查是否与已匹配区域重叠
+                key = (idx, ja)
                 term_range = set(range(idx, idx + len(ja)))
-                if term_range & matched_indices:
+                # 只阻挡与"不同 ja"的已匹配区域重叠（避免短术语截断长术语）
+                overlaps_diff = any(
+                    other_ja != ja and set(range(oi, oi + len(other_ja))) & term_range
+                    for oi, other_ja in matched_spans
+                )
+                if overlaps_diff:
                     pos = idx + 1
                     continue
-                matched_indices.update(term_range)
-                results.append({"ja": ja, "zh": term["zh"], "note": term["note"]})
+                matched_spans.setdefault(key, []).append(
+                    {"ja": ja, "zh": term["zh"], "note": term["note"]}
+                )
                 pos = idx + len(ja)
 
+        for entries in matched_spans.values():
+            results.extend(entries)
         return results
 
 
