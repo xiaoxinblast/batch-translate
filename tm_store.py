@@ -148,7 +148,10 @@ class TranslationMemory:
                 continue
             results.append({"fragment_source": fs, "match_source": e["source"], "match_target": e["target"], "_overlap": overlap})
         for r in results: del r["_overlap"]
-        return results[:top_n]
+        # 包含去重
+        filtered = [r for r in results
+                    if not any(r is not r2 and r["fragment_source"] in r2["fragment_source"] for r2 in results)]
+        return filtered[:top_n]
 
 
 if __name__ == "__main__":
