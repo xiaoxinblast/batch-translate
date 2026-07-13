@@ -103,12 +103,11 @@ class TranslationMemory:
     # ── 片段匹配 ──────────────────────────────────────────────────
 
     def find_fragment_matches(
-        self, source: str, min_match_len: int = 4, top_n: int = 5,
+        self, source: str, top_n: int = 5,
         candidate_limit: int = 20, exclude_sources: set[str] | None = None,
-        min_freq: int = 3, max_freq: int = 30,
     ) -> list[dict]:
-        """n-gram + LCS 片段匹配。exclude_sources 跳过整句已匹配条目。
-        min_freq/max_freq 过滤出现次数：太少不可靠，太多是噪声。"""
+        """用 n-gram 索引找到共享子串最多的 TM 条目（已从整句匹配中排除）。
+        不截取片段——AI 自行对照完整 source/target 判断对应。"""
         self.load()
         if not self._entries or not source or (not self._ngram_index and not self._ngram2_index):
             return []
@@ -122,51 +121,16 @@ class TranslationMemory:
         candidate_scores = _get(self._ngram_index, self._extract_ngrams(source))
         if not candidate_scores and self._ngram2_index:
             candidate_scores = _get(self._ngram2_index, self._extract_ngrams(source, n=2))
-            min_match_len = max(3, min_match_len - 1)
         if not candidate_scores: return []
 
-        top_candidates = sorted(candidate_scores.items(), key=lambda x: -x[1])[:candidate_limit]
-        qp = self._tag_re.sub("", source)
-        results: list[dict] = []; seen: set = set()
         exclude = exclude_sources or set()
-
-        for idx, _ in top_candidates:
+        results = []
+        for idx, ngram_count in sorted(candidate_scores.items(), key=lambda x: -x[1])[:candidate_limit]:
             e = self._entries[idx]
             if e["source"] in exclude: continue
-            ep = self._tag_re.sub("", e["source"])
-            m = SequenceMatcher(None, qp, ep)
-            while True:
-                match = m.find_longest_match(0, len(qp), 0, len(ep))
-                if match.size < min_match_len: break
-                for b in m.get_matching_blocks():
-                    if b.size < min_match_len: continue
-                    fs = qp[b.a:b.a+b.size].strip()
-                    if (fs, e["source"]) in seen: continue
-                    seen.add((fs, e["source"]))
-                    freq = self._fragment_frequency(fs)
-                    if freq < min_freq or freq > max_freq: continue
-                    results.append({"fragment_source": fs, "match_source": e["source"], "match_target": e["target"]})
-                break
-        results.sort(key=lambda x: -len(x["fragment_source"]))
-        filtered = []
-        for r in results:
-            if not any(r is not r2 and r["fragment_source"] in r2["fragment_source"] for r2 in results):
-                filtered.append(r)
-        return filtered[:top_n]
-
-    def _fragment_frequency(self, fragment: str) -> int:
-        """估算片段在 TM 中出现的条目数（通过 3-gram 交集）。"""
-        frag = self._normalize(fragment)
-        if len(frag) < 3: return 999  # 太短无法估算，直接丢弃
-        grams = []
-        for i in range(len(frag) - 2):
-            g = frag[i:i+3]
-            if g in self._ngram_index:
-                grams.append(self._ngram_index[g])
-            else:
-                return 0  # 有 3-gram 不在索引里 → 片段不可能出现在任何条目
-        if not grams: return 0
-        return len(set.intersection(*grams))
+            if e["source"] in {r["match_source"] for r in results}: continue
+            results.append({"match_source": e["source"], "match_target": e["target"]})
+        return results[:top_n]
 
 
 if __name__ == "__main__":
