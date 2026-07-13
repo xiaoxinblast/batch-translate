@@ -138,7 +138,8 @@ class TranslationMemory:
             overlap = match.size / len(ep) if len(ep) > 0 else 0
             if overlap < 0.3: continue
             if e["source"] in {r["match_source"] for r in results}: continue
-            results.append({"match_source": e["source"], "match_target": e["target"]})
+            fs = qp[match.a:match.a + match.size].strip()
+            results.append({"fragment_source": fs, "match_source": e["source"], "match_target": e["target"]})
         return results[:top_n]
 
 
