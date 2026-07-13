@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""翻译记忆：JSON 存储 + difflib 模糊检索 + n-gram 片段匹配（3-gram + 2-gram 降级 + 全半角归一化）。"""
+"""翻译记忆：JSON 存储 + difflib 模糊检索 + n-gram 片段匹配。"""
 
 import json, re, sys
 from difflib import SequenceMatcher
@@ -21,31 +21,27 @@ class TranslationMemory:
     # ── 加载 / 保存 ───────────────────────────────────────────────
 
     def load(self) -> list[dict]:
-        if self._loaded:
-            return self._entries
+        if self._loaded: return self._entries
         if self._path.is_file():
             try:
-                with open(self._path, "r", encoding="utf-8") as f:
-                    self._entries = json.load(f).get("entries", [])
+                self._entries = json.load(open(self._path, encoding="utf-8")).get("entries", [])
             except (json.JSONDecodeError, KeyError):
                 self._entries = []
-        self._loaded = True
-        self._build_ngram_index()
+        self._loaded = True; self._build_ngram_index()
         return self._entries
 
     def save(self):
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._path, "w", encoding="utf-8") as f:
-            json.dump({"entries": self._entries}, f, ensure_ascii=False, indent=2)
+        json.dump({"entries": self._entries}, open(self._path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
     def add(self, entries: list[dict], dedup: bool = True):
         self.load()
         if dedup:
             existing = {(e["source"], e.get("context", "")) for e in self._entries}
-            for entry in entries:
-                k = (entry.get("source", "").strip(), entry.get("context", "").strip())
+            for e in entries:
+                k = (e.get("source", "").strip(), e.get("context", "").strip())
                 if k not in existing:
-                    self._entries.append({"source": entry.get("source", ""), "target": entry.get("target", ""), "context": entry.get("context", ""), "file": entry.get("file", "")})
+                    self._entries.append({"source": e.get("source", ""), "target": e.get("target", ""), "context": e.get("context", ""), "file": e.get("file", "")})
                     existing.add(k)
         else:
             self._entries.extend(entries)
@@ -79,10 +75,8 @@ class TranslationMemory:
         "ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ"
         "ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ"
         "０１２３４５６７８９＂＃＄％＆＇（）＊＋，－．／：；＜＝＞？＠［＼］＾＿｀｛｜｝～",
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "abcdefghijklmnopqrstuvwxyz"
-        "0123456789\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
-    )
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ""abcdefghijklmnopqrstuvwxyz"
+        "0123456789\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 
     @classmethod
     def _normalize(cls, text: str) -> str:
@@ -108,31 +102,36 @@ class TranslationMemory:
 
     # ── 片段匹配 ──────────────────────────────────────────────────
 
-    def find_fragment_matches(self, source: str, min_match_len: int = 4, top_n: int = 5, candidate_limit: int = 20) -> list[dict]:
+    def find_fragment_matches(
+        self, source: str, min_match_len: int = 4, top_n: int = 5,
+        candidate_limit: int = 20, exclude_sources: set[str] | None = None,
+    ) -> list[dict]:
+        """n-gram + LCS 片段匹配。exclude_sources 跳过已在整句匹配中的 TM 条目。"""
         self.load()
-        if not self._entries or not source or (not self._ngram_index and not self._ngram2_index): return []
+        if not self._entries or not source or (not self._ngram_index and not self._ngram2_index):
+            return []
 
-        # 先走 3-gram，再降级 2-gram
-        def _get_candidates(ngram_idx, grams):
+        def _get(ngram_idx, grams):
             cs: dict[int, int] = {}
             for g in grams:
                 for idx in ngram_idx.get(g, ()): cs[idx] = cs.get(idx, 0) + 1
             return cs
 
-        candidate_scores = _get_candidates(self._ngram_index, self._extract_ngrams(source))
-        using_2gram = False
+        candidate_scores = _get(self._ngram_index, self._extract_ngrams(source))
         if not candidate_scores and self._ngram2_index:
-            candidate_scores = _get_candidates(self._ngram2_index, self._extract_ngrams(source, n=2))
-            using_2gram = True
-            min_match_len = max(3, min_match_len - 1)  # 2-gram 时放宽到 3 字
+            candidate_scores = _get(self._ngram2_index, self._extract_ngrams(source, n=2))
+            min_match_len = max(3, min_match_len - 1)
         if not candidate_scores: return []
 
         top_candidates = sorted(candidate_scores.items(), key=lambda x: -x[1])[:candidate_limit]
         qp = self._tag_re.sub("", source)
         results: list[dict] = []; seen: set = set()
+        exclude = exclude_sources or set()
 
         for idx, _ in top_candidates:
-            e = self._entries[idx]; ep = self._tag_re.sub("", e["source"])
+            e = self._entries[idx]
+            if e["source"] in exclude: continue  # 整句已匹配过，跳过
+            ep = self._tag_re.sub("", e["source"])
             m = SequenceMatcher(None, qp, ep)
             while True:
                 match = m.find_longest_match(0, len(qp), 0, len(ep))
@@ -143,70 +142,14 @@ class TranslationMemory:
                     if (fs, e["source"]) in seen: continue
                     seen.add((fs, e["source"]))
                     sim = b.size / len(qp[b.a:b.a+b.size]) if b.size else 0
-                    ft, cf = self._align_fragment_target(e["source"], e["target"], ep, b.b, b.b+b.size)
-                    # 纯假名片段无 CJK 锚点，对齐不可靠 → 降级
-                    if cf == "high" and self._kana_ratio(fs) > 0.8:
-                        cf = "medium"
-                    # 短片段（< 8 字）target 提取误差大，降级
-                    if cf == "high" and len(fs) < 8:
-                        cf = "medium"
-                    results.append({"fragment_source": fs, "fragment_target": ft, "fragment_target_confidence": cf, "match_source": e["source"], "match_target": e["target"], "similarity": round(sim, 4)})
+                    results.append({"fragment_source": fs, "match_source": e["source"], "match_target": e["target"], "similarity": round(sim, 4)})
                 break
         results.sort(key=lambda x: (-x["similarity"], -len(x["fragment_source"])))
-        # 包含去重：过滤掉被更长片段完全包含的短片段
         filtered = []
         for r in results:
             if not any(r is not r2 and r["fragment_source"] in r2["fragment_source"] for r2 in results):
                 filtered.append(r)
         return filtered[:top_n]
-
-    # ── 假名检测 ──────────────────────────────────────────────────
-
-    _kana_re = re.compile(r'[\u3040-\u309f\u30a0-\u30ff]')
-    _cjk_re = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]')
-
-    @classmethod
-    def _kana_ratio(cls, text: str) -> float:
-        if not text: return 0
-        k = len(cls._kana_re.findall(text)); c = len(cls._cjk_re.findall(text))
-        return k / (k + c) if (k + c) > 0 else 1.0
-
-    # ── 片段译文对齐 ──────────────────────────────────────────────
-
-    _split_tag_re = re.compile(r'(<actor>)|(<i>|</i>)|(<tag\s[^>]+/>)|(\n)')
-
-    @staticmethod
-    def _split_by_tags(source: str, target: str) -> list[tuple[str, str]]:
-        sp = [p for p in TranslationMemory._split_tag_re.split(source) if p is not None]
-        tp = [p for p in TranslationMemory._split_tag_re.split(target) if p is not None]
-        n = max(len(sp), len(tp)); segs = []
-        for i in range(n):
-            s = sp[i].strip() if i < len(sp) else ""; t = tp[i].strip() if i < len(tp) else ""
-            if s or t: segs.append((s, t))
-        return segs
-
-    def _align_fragment_target(self, src_full: str, tgt_full: str, src_plain: str, frag_start: int, frag_end: int) -> tuple[str, str]:
-        tgt_plain = self._tag_re.sub("", tgt_full)
-        st, tt = len(src_plain), len(tgt_plain)
-        if st == 0 or tt == 0: return tgt_full, "full_sentence"
-        if st < 20 and not self._split_tag_re.search(src_full): return tgt_full, "full_sentence"
-        segs = self._split_by_tags(src_full, tgt_full)
-        if segs:
-            ss = [self._tag_re.sub("", s) for s, _ in segs]; ts = [self._tag_re.sub("", t) for _, t in segs]
-            acc = 0
-            for sp, tp in zip(ss, ts):
-                sl, tl = len(sp), len(tp)
-                if sl == 0: continue
-                if frag_end > acc and frag_start < acc + sl:
-                    ls, le = max(0, frag_start - acc), min(sl, frag_end - acc)
-                    if tl > 0:
-                        t_s = max(0, min(int(ls/sl*tl), tl-1)); t_e = max(t_s+1, min(int(le/sl*tl), tl))
-                        tgt = tp[t_s:t_e].strip()
-                        if tgt: return tgt, "high"
-                acc += sl
-        s = max(0, min(int(frag_start/st*tt), tt-1)); e = max(s+1, min(int(frag_end/st*tt), tt))
-        tgt = tgt_plain[s:e].strip()
-        return tgt, "medium" if tgt else "full_sentence"
 
 
 if __name__ == "__main__":
@@ -216,9 +159,9 @@ if __name__ == "__main__":
     p.add_argument("--search"); p.add_argument("--threshold", type=float, default=0.6)
     a = p.parse_args()
     tm = TranslationMemory(a.file); tm.load()
-    if a.stats: print(f"总条目: {len(tm)} | 3-gram: {len(tm._ngram_index)} | 2-gram: {len(tm._ngram2_index)}")
+    if a.stats: print(f"总条目: {len(tm)} | 3g: {len(tm._ngram_index)} | 2g: {len(tm._ngram2_index)}")
     elif a.search:
         for m in tm.find_matches(a.search, threshold=a.threshold):
             print(f"  [{m['similarity']:.2f}] {m['source'][:60]} → {m['target'][:60]}")
-        print("  (无匹配)" if not tm.find_matches(a.search, threshold=a.threshold) else "")
+        if not tm.find_matches(a.search, threshold=a.threshold): print("  (无匹配)")
     else: p.print_help()
