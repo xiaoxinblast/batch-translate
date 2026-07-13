@@ -136,7 +136,7 @@ class TranslationMemory:
             m = SequenceMatcher(None, qp, ep)
             match = m.find_longest_match(0, len(qp), 0, len(ep))
             overlap = match.size / len(ep) if len(ep) > 0 else 0
-            if overlap < 0.4: continue
+            if overlap < 0.3: continue
             if e["source"] in {r["match_source"] for r in results}: continue
             results.append({"match_source": e["source"], "match_target": e["target"]})
         return results[:top_n]
