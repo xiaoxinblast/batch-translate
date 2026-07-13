@@ -126,6 +126,11 @@ def _enrich_working_json(json_path: Path, state: dict):
                 matches = tm.find_matches(plain, query_context=e.get("context", ""))
                 if matches:
                     e["tm_matches"] = matches
+                # 片段匹配
+                if not matches or all(m["similarity"] < 0.85 for m in matches):
+                    frag_matches = tm.find_fragment_matches(plain)
+                    if frag_matches:
+                        e["tm_fragments"] = frag_matches
         except ImportError:
             pass
 

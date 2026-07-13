@@ -19,6 +19,7 @@ class TranslationMemory:
         self._path = Path(json_path)
         self._entries: list[dict] = []  # [{source, target, context, file}]
         self._loaded = False
+        self._ngram_index: dict[str, set[int]] = {}  # {3-gram: {entry_idx, ...}}
 
     # ── 加载 / 保存 ───────────────────────────────────────────────
 
@@ -35,6 +36,7 @@ class TranslationMemory:
                 self._entries = []
 
         self._loaded = True
+        self._build_ngram_index()
         return self._entries
 
     def save(self):
@@ -119,6 +121,123 @@ class TranslationMemory:
     def __len__(self) -> int:
         self.load()
         return len(self._entries)
+
+    # ── n-gram 倒排索引 ───────────────────────────────────────────
+
+    _ngram_skip_re = re.compile(r"[\s\u3000\u0020,.!?;:()\[\]{}「」『』、。！？…\-]+")
+
+    def _build_ngram_index(self, n: int = 3):
+        """为所有 TM 条目的 source 构建字符 n-gram 倒排索引。"""
+        self._ngram_index.clear()
+        for idx, entry in enumerate(self._entries):
+            plain = self._tag_re.sub("", entry["source"])
+            # 按标点/空白切段，每段内滑窗取 n-gram
+            segments = self._ngram_skip_re.split(plain)
+            for seg in segments:
+                if len(seg) < n:
+                    continue
+                for i in range(len(seg) - n + 1):
+                    gram = seg[i:i + n]
+                    if gram not in self._ngram_index:
+                        self._ngram_index[gram] = set()
+                    self._ngram_index[gram].add(idx)
+
+    def _extract_ngrams(self, text: str, n: int = 3) -> set[str]:
+        """从文本中提取 n-gram 集合。"""
+        plain = self._tag_re.sub("", text)
+        segments = self._ngram_skip_re.split(plain)
+        grams = set()
+        for seg in segments:
+            if len(seg) < n:
+                continue
+            for i in range(len(seg) - n + 1):
+                grams.add(seg[i:i + n])
+        return grams
+
+    # ── 片段匹配 ──────────────────────────────────────────────────
+
+    def find_fragment_matches(
+        self,
+        source: str,
+        min_match_len: int = 5,
+        top_n: int = 5,
+        candidate_limit: int = 20,
+    ) -> list[dict]:
+        """
+        n-gram 索引驱动的片段匹配：把 source 拆为 3-gram，查索引找候选条目，
+        用 LCS 提取实际匹配的连续片段，对齐到 target 获取翻译片段。
+        返回 [{fragment_source, fragment_target, similarity, match_source}, ...]。
+        """
+        self.load()
+        if not self._entries or not source or not self._ngram_index:
+            return []
+
+        # 1. 提取 query n-gram，统计每个候选条目的共享 n-gram 数
+        query_grams = self._extract_ngrams(source)
+        if not query_grams:
+            return []
+
+        candidate_scores: dict[int, int] = {}
+        for gram in query_grams:
+            for idx in self._ngram_index.get(gram, ()):
+                candidate_scores[idx] = candidate_scores.get(idx, 0) + 1
+
+        if not candidate_scores:
+            return []
+
+        # 取共享 n-gram 最多的 top candidate_limit 个候选
+        top_candidates = sorted(
+            candidate_scores.items(), key=lambda x: -x[1]
+        )[:candidate_limit]
+
+        query_plain = self._tag_re.sub("", source)
+        results: list[dict] = []
+        seen_fragments: set[tuple[str, str]] = set()
+
+        # 2. 对每个候选条目用 LCS 提取匹配片段
+        for idx, _score in top_candidates:
+            entry = self._entries[idx]
+            entry_plain = self._tag_re.sub("", entry["source"])
+
+            # 用 find_longest_match 迭代提取最长公共子串
+            matcher = SequenceMatcher(None, query_plain, entry_plain)
+            remaining_q = list(range(len(query_plain)))
+
+            while True:
+                match = matcher.find_longest_match(
+                    0, len(query_plain), 0, len(entry_plain)
+                )
+                if match.size < min_match_len:
+                    break
+
+                frag_src = query_plain[match.a:match.a + match.size].strip()
+                if not frag_src or len(frag_src) < min_match_len:
+                    # 前进跳过这个过短的匹配
+                    # 用 get_matching_blocks 一次性获取所有匹配块
+                    break
+
+                # 获取所有 matching blocks 一次性处理
+                blocks = matcher.get_matching_blocks()
+                for b in blocks:
+                    if b.size < min_match_len:
+                        continue
+                    frag_src = query_plain[b.a:b.a + b.size].strip()
+                    key = (frag_src, entry["source"])
+                    if key in seen_fragments:
+                        continue
+                    seen_fragments.add(key)
+
+                    similarity = b.size / len(query_plain[b.a:b.a + b.size]) if b.size > 0 else 0
+                    results.append({
+                        "fragment_source": frag_src,
+                        "match_source": entry["source"],
+                        "match_target": entry["target"],
+                        "similarity": round(similarity, 4),
+                    })
+                break  # get_matching_blocks 已获取所有块，跳出 while
+
+        results.sort(key=lambda x: (-x["similarity"], -len(x["fragment_source"])))
+        return results[:top_n]
 
 
 # ── CLI ──────────────────────────────────────────────────────────

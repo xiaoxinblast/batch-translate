@@ -686,6 +686,11 @@ def export_to_json(
             if matches:
                 record["tm_matches"] = matches
                 tm_total += 1
+            # 片段匹配：仅当整句匹配为空或最高分 < 0.85 时才启用
+            if not matches or all(m["similarity"] < 0.85 for m in matches):
+                frag_matches = tm.find_fragment_matches(tu.source_text)
+                if frag_matches:
+                    record["tm_fragments"] = frag_matches
 
         records.append(record)
 
