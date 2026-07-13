@@ -1,6 +1,6 @@
 # batch-translate — 批量翻译工作流
 
-配合 Claude Code Skill 使用的批量翻译工具，支持 日→中 翻译 + 校对 全自动循环。
+配合 Reasonix Skill 使用的批量翻译工具，支持 日→中 翻译 + 校对 全自动循环。
 
 ## 支持格式
 
@@ -8,11 +8,11 @@ mqxliff（MemoQ） · docx · xlsx · txt · csv · tsv
 
 ## 快速开始
 
-**前置：** 安装 Claude Code Skill → [batch-translate-skill](https://github.com/xiaoxinblast/batch-translate-skill)，然后对 Claude 说：
+**前置：** 安装 Reasonix Skill → [batch-translate-skill](https://github.com/xiaoxinblast/batch-translate-skill)，然后对话：
 
 > "开始批量翻译"
 
-Claude 会自动完成：初始化 → 语境分析 → 翻译 → 校对 → 写回，全部自动化。
+Reasonix 会自动完成：初始化 → 语境分析 → 翻译 → 校对 → 写回，全部自动化。
 
 ## 手动使用
 
