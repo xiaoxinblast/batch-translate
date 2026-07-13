@@ -137,9 +137,17 @@ class TranslationMemory:
             match = m.find_longest_match(0, len(qp), 0, len(ep))
             overlap = match.size / len(ep) if len(ep) > 0 else 0
             if overlap < 0.3: continue
-            if e["source"] in {r["match_source"] for r in results}: continue
             fs = qp[match.a:match.a + match.size].strip()
-            results.append({"fragment_source": fs, "match_source": e["source"], "match_target": e["target"]})
+            # 同片段去重：保留重叠度最高的那一条 TM 条目
+            existing = next((r for r in results if r["fragment_source"] == fs), None)
+            if existing:
+                if overlap > existing.get("_overlap", 0):
+                    existing["match_source"] = e["source"]
+                    existing["match_target"] = e["target"]
+                    existing["_overlap"] = overlap
+                continue
+            results.append({"fragment_source": fs, "match_source": e["source"], "match_target": e["target"], "_overlap": overlap})
+        for r in results: del r["_overlap"]
         return results[:top_n]
 
 
