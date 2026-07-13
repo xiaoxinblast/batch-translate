@@ -124,21 +124,19 @@ class TranslationMemory:
         if not candidate_scores: return []
 
         exclude = exclude_sources or set()
-        # 计算每个候选的 n-gram 密度（共享数/条目总n-gram数），优先短而匹配度高的
-        scored = []
-        for idx, count in candidate_scores.items():
-            e = self._entries[idx]
-            if e["source"] in exclude: continue
-            total = len(self._extract_ngrams(e["source"]))
-            density = count / total if total > 0 else 0
-            scored.append((density, idx))
-        scored.sort(key=lambda x: -x[0])
-
+        # n-gram 找候选 → LCS 验证实质性重叠
+        qp = self._tag_re.sub("", source)
         results = []
-        for density, idx in scored[:candidate_limit]:
+        for idx, count in sorted(candidate_scores.items(), key=lambda x: -x[1])[:candidate_limit]:
             e = self._entries[idx]
             if e["source"] in exclude: continue
-            if len(self._tag_re.sub("", e["source"])) < 10: continue   # 过滤噪音（单字/词级条目）
+            ep = self._tag_re.sub("", e["source"])
+            if len(ep) < 10: continue
+            # LCS 最长匹配块 / 条目长度 → 重叠度
+            m = SequenceMatcher(None, qp, ep)
+            match = m.find_longest_match(0, len(qp), 0, len(ep))
+            overlap = match.size / len(ep) if len(ep) > 0 else 0
+            if overlap < 0.4: continue
             if e["source"] in {r["match_source"] for r in results}: continue
             results.append({"match_source": e["source"], "match_target": e["target"]})
         return results[:top_n]
