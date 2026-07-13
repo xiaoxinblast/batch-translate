@@ -1,12 +1,8 @@
 __pycache__/
 *.pyc
-data/batch_state.json
-data/_working_*
-data/tm_memory.json
+data/
 exports/*
 !exports/.gitkeep
-data/style_guide.txt
-data/term_base.xlsx
-data/tm_memory.json
-data/batch_state.json
-data/_working_*
+!exports/translator_skill.md
+!exports/trans_reviewer_skill.md
+!exports/context_analyzer_skill.md
