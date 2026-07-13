@@ -141,6 +141,9 @@ class TranslationMemory:
                     seen.add((fs, e["source"]))
                     sim = b.size / len(qp[b.a:b.a+b.size]) if b.size else 0
                     ft, cf = self._align_fragment_target(e["source"], e["target"], ep, b.b, b.b+b.size)
+                    # 纯假名片段无 CJK 锚点，对齐不可靠 → 降级
+                    if cf == "high" and self._kana_ratio(fs) > 0.8:
+                        cf = "medium"
                     results.append({"fragment_source": fs, "fragment_target": ft, "fragment_target_confidence": cf, "match_source": e["source"], "match_target": e["target"], "similarity": round(sim, 4)})
                 break
         results.sort(key=lambda x: (-x["similarity"], -len(x["fragment_source"])))
@@ -150,6 +153,17 @@ class TranslationMemory:
             if not any(r is not r2 and r["fragment_source"] in r2["fragment_source"] for r2 in results):
                 filtered.append(r)
         return filtered[:top_n]
+
+    # ── 假名检测 ──────────────────────────────────────────────────
+
+    _kana_re = re.compile(r'[\u3040-\u309f\u30a0-\u30ff]')
+    _cjk_re = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]')
+
+    @classmethod
+    def _kana_ratio(cls, text: str) -> float:
+        if not text: return 0
+        k = len(cls._kana_re.findall(text)); c = len(cls._cjk_re.findall(text))
+        return k / (k + c) if (k + c) > 0 else 1.0
 
     # ── 片段译文对齐 ──────────────────────────────────────────────
 
