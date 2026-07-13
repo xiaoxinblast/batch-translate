@@ -144,7 +144,12 @@ class TranslationMemory:
                     results.append({"fragment_source": fs, "fragment_target": ft, "fragment_target_confidence": cf, "match_source": e["source"], "match_target": e["target"], "similarity": round(sim, 4)})
                 break
         results.sort(key=lambda x: (-x["similarity"], -len(x["fragment_source"])))
-        return results[:top_n]
+        # 包含去重：过滤掉被更长片段完全包含的短片段
+        filtered = []
+        for r in results:
+            if not any(r is not r2 and r["fragment_source"] in r2["fragment_source"] for r2 in results):
+                filtered.append(r)
+        return filtered[:top_n]
 
     # ── 片段译文对齐 ──────────────────────────────────────────────
 
