@@ -108,7 +108,7 @@ class TranslationMemory:
 
     # ── 片段匹配 ──────────────────────────────────────────────────
 
-    def find_fragment_matches(self, source: str, min_match_len: int = 5, top_n: int = 5, candidate_limit: int = 20) -> list[dict]:
+    def find_fragment_matches(self, source: str, min_match_len: int = 4, top_n: int = 5, candidate_limit: int = 20) -> list[dict]:
         self.load()
         if not self._entries or not source or (not self._ngram_index and not self._ngram2_index): return []
 
@@ -120,8 +120,11 @@ class TranslationMemory:
             return cs
 
         candidate_scores = _get_candidates(self._ngram_index, self._extract_ngrams(source))
+        using_2gram = False
         if not candidate_scores and self._ngram2_index:
             candidate_scores = _get_candidates(self._ngram2_index, self._extract_ngrams(source, n=2))
+            using_2gram = True
+            min_match_len = max(3, min_match_len - 1)  # 2-gram 时放宽到 3 字
         if not candidate_scores: return []
 
         top_candidates = sorted(candidate_scores.items(), key=lambda x: -x[1])[:candidate_limit]
@@ -143,6 +146,9 @@ class TranslationMemory:
                     ft, cf = self._align_fragment_target(e["source"], e["target"], ep, b.b, b.b+b.size)
                     # 纯假名片段无 CJK 锚点，对齐不可靠 → 降级
                     if cf == "high" and self._kana_ratio(fs) > 0.8:
+                        cf = "medium"
+                    # 短片段（< 8 字）target 提取误差大，降级
+                    if cf == "high" and len(fs) < 8:
                         cf = "medium"
                     results.append({"fragment_source": fs, "fragment_target": ft, "fragment_target_confidence": cf, "match_source": e["source"], "match_target": e["target"], "similarity": round(sim, 4)})
                 break
