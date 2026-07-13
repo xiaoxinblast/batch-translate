@@ -138,6 +138,7 @@ class TranslationMemory:
         for density, idx in scored[:candidate_limit]:
             e = self._entries[idx]
             if e["source"] in exclude: continue
+            if len(e["source"]) < 10: continue   # 过滤噪音（单字/词级条目）
             if e["source"] in {r["match_source"] for r in results}: continue
             results.append({"match_source": e["source"], "match_target": e["target"]})
         return results[:top_n]
