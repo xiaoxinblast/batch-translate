@@ -3,6 +3,3 @@ __pycache__/
 data/
 exports/*
 !exports/.gitkeep
-!exports/translator_skill.md
-!exports/trans_reviewer_skill.md
-!exports/context_analyzer_skill.md
