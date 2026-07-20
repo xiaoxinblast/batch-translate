@@ -273,6 +273,39 @@ def _replace_tags_with_ph(text: str, tag_map: dict[str, InlineTag]) -> str:
     将 text 中的 <tag id='N' ... /> 替换回原始 XLIFF 元素 XML（ph/bpt/ept）。
     返回的字符串是多个 text + XML 片段的混合（XLIFF mixed content）。
     """
+    # ═══════════════════════════════════════════════════════════════════
+    # 预处理：将 Agent 可能输出的裸标签（<actor>、<button=L1> 等）转回 <tag> 格式
+    # Agent 输出裸标签是合理行为（更可读），但写回 mqxliff 时需要还原为 ph 元素
+    # ═══════════════════════════════════════════════════════════════════
+    _bare_tag_re = re.compile(r"<(/?[a-zA-Z][a-zA-Z0-9]*(?:=[^>]*)?)>")
+    if _bare_tag_re.search(text):
+        # 构建 desc（⟨⟩ 格式）→ tag 的反向索引（仅 fmt 类型）
+        desc_to_tag: dict[str, InlineTag] = {}
+        for tag in tag_map.values():
+            if tag.tag_type in ("fmt", "/fmt", "fmt-open", "fmt-close") and tag.desc:
+                desc_to_tag[tag.desc] = tag
+
+        def _replace_bare(m: re.Match) -> str:
+            """将裸标签如 <actor> 替换为 <tag id='N' .../> 或保留原样"""
+            bare = m.group(0)
+            # 尝试匹配：bare "<actor>" → desc "⟨actor⟩"
+            inner = bare[1:-1]  # 去掉 <>
+            desc_candidate = f"⟨{inner}⟩"
+            if desc_candidate in desc_to_tag:
+                tag = desc_to_tag[desc_candidate]
+                return _tag_to_marker(tag)
+            # 也尝试闭合标签形式 "</actor>" → desc "⟨/actor⟩"
+            if bare.startswith("</"):
+                desc_candidate = f"⟨/{inner[1:] if inner.startswith('/') else inner}⟩"
+            else:
+                desc_candidate = f"⟨{inner}⟩"
+            if desc_candidate in desc_to_tag:
+                tag = desc_to_tag[desc_candidate]
+                return _tag_to_marker(tag)
+            return m.group(0)  # 无法匹配则保留原样
+
+        text = _bare_tag_re.sub(_replace_bare, text)
+
     result_parts = []
     last_end = 0
 
