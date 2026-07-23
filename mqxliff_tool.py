@@ -557,11 +557,19 @@ def write_translations(
             skipped_locked += 1
             continue
 
-        # 更新 target 元素
+        # 更新 target 元素（不存在则创建）
         target_elem = tu_elem.find(f"{{{XLIFF_NS}}}target")
         if target_elem is None:
-            # 不应该出现，但安全处理
-            continue
+            # 为没有 target 的条目创建 target 元素（插入在 source 之后）
+            source_elem = tu_elem.find(f"{{{XLIFF_NS}}}source")
+            if source_elem is None:
+                continue
+            # 用 lxml 创建 target 元素，继承 source 之后的 tail（换行/缩进）
+            target_elem = etree.SubElement(tu_elem, f"{{{XLIFF_NS}}}target")
+            target_elem.tail = source_elem.tail  # 取走 source 的 tail 给 target
+            source_elem.tail = "\n" + (" " * 16)  # 给 source 补一个换行+缩进
+            # 设置 xml:space="preserve"
+            target_elem.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
 
         # 将 <tag ... /> 替换回原始 XLIFF 元素
         if tu and tu.source_tag_map:
