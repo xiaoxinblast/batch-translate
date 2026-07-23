@@ -305,12 +305,23 @@ def cmd_init(
     # 术语/TM 增强（即使 TM 为空也做术语匹配；跨文件 TM 可复用）
     _enrich_working_json(export_file, state)
 
+    # 检测混合文件（部分条目有译文、部分无）
+    with open(export_file, "r", encoding="utf-8") as f:
+        enriched = json.load(f)
+    existing_targets = sum(1 for e in enriched["entries"] if e.get("target") and e["target"].strip())
+    state["existing_targets"] = existing_targets
+    _save_state(state)
+
     # 显示分批信息
     avg = sum(e - s for s, e in batches) / total_batches
     print(f"✅ 初始化完成")
     print(f"   文件: {export_file.name}")
     print(f"   总数: {total} 条, 每批 ~{batch_chars} 字, 共 {total_batches} 批（平均 ~{avg:.0f} 条/批）")
     print(f"   上下文窗口: {context_size} 条")
+    if 0 < existing_targets < total:
+        print(f"   🔀 混合文件: {existing_targets}/{total} 条已有译文（translate 模式将自动锁定已有译文）")
+    elif existing_targets == total:
+        print(f"   📝 全部有译文: 建议使用 next --review 跳过翻译直接校对")
     print()
     print(document_summary)
     print()
@@ -385,9 +396,11 @@ def cmd_next(review_only: bool = False):
         return
 
     # ── 翻译模式 ──
-    # 当前批次条目（去掉 target 字段，AI 只需要 source/terms/tm/context）
+    # 构建批次条目：已有译文的条目注入为 locked，空条目正常翻译
     batch_entries = []
+    locked_count = 0
     for e in entries[start:end]:
+        existing_target = e.get("target", "").strip()
         item = {
             "id": e["id"],
             "source": e["source"],
@@ -400,10 +413,27 @@ def cmd_next(review_only: bool = False):
             item["terms"] = e["terms"]
         if e.get("tm_matches"):
             item["tm_matches"] = e["tm_matches"]
+        # 混合文件支持：已有译文 → 锁定，空条目 → 待翻译
+        if existing_target:
+            item["target"] = existing_target
+            item["locked"] = True
+            item["note"] = (item.get("note", "") + " 【已有100%匹配译文，除非明显错误否则不要修改】").strip()
+            locked_count += 1
+        else:
+            item["target"] = ""
+            item["locked"] = False
         batch_entries.append(item)
 
     # 构建 batch JSON
     batch = {}
+    if locked_count > 0:
+        instr = (
+            f"本批共 {len(batch_entries)} 条，其中 {locked_count} 条 locked=true（已有100%匹配译文，target 已填入），"
+            f"请直接保留其 target 不做修改（除非译文存在明显意思错误）。"
+            f"其余 {len(batch_entries) - locked_count} 条 target 为空，需要从零翻译。"
+        )
+    else:
+        instr = ""
     batch["instructions"] = (
         "翻译过程中遇到任何不确定的术语、专有名词、角色名、上下文含义时，"
         "不要猜测，应主动搜索项目文件或联网搜索以获取准确信息后，再给出确定译文。"
@@ -411,6 +441,7 @@ def cmd_next(review_only: bool = False):
         "和 terms（术语库匹配），翻译时优先参考。"
         "原文中的 <tag .../> 内联标签必须原样保留在译文中，数量和位置不变。"
         "最终返回结果必须是干净的译文，不要附加任何标注或说明。"
+        + ("\n\n" + instr if instr else "")
     )
     if state.get("document_summary"):
         batch["document_summary"] = state["document_summary"]
@@ -427,6 +458,8 @@ def cmd_next(review_only: bool = False):
         json.dump(batch, f, ensure_ascii=False, indent=2)
 
     print(f"📤 Batch {batch_num}/{state['total_batches']}  条目 {start + 1}-{end}（共 {total} 条）")
+    if locked_count > 0:
+        print(f"   🔒 其中 {locked_count} 条已有译文（locked=true），{len(batch_entries) - locked_count} 条待翻译")
     print(f"   输出: {out_path.name}")
     if context_entries:
         print(f"   上文: {len(context_entries)} 条（id={context_entries[0]['id']}-{context_entries[-1]['id']}）")
