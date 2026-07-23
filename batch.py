@@ -417,7 +417,7 @@ def cmd_next(review_only: bool = False):
         if existing_target:
             item["target"] = existing_target
             item["locked"] = True
-            item["note"] = (item.get("note", "") + " 【已有100%匹配译文，除非明显错误否则不要修改】").strip()
+            item["note"] = (item.get("note", "") + " 【已有100%匹配译文，严禁修改】").strip()
             locked_count += 1
         else:
             item["target"] = ""
@@ -429,7 +429,7 @@ def cmd_next(review_only: bool = False):
     if locked_count > 0:
         instr = (
             f"本批共 {len(batch_entries)} 条，其中 {locked_count} 条 locked=true（已有100%匹配译文，target 已填入），"
-            f"请直接保留其 target 不做修改（除非译文存在明显意思错误）。"
+            f"请直接保留其 target，严禁对译文进行任何改动。"
             f"其余 {len(batch_entries) - locked_count} 条 target 为空，需要从零翻译。"
         )
     else:
