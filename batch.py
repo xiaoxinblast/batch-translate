@@ -170,7 +170,7 @@ def _build_review_json(
         "逐条核对译文与原文：1)术语是否准确统一 2)标点格式是否符合规范 "
         "3)语气是否符合角色 4)表达是否自然流畅、无翻译腔。"
         + (
-            "每条 entry 可能带有 tm_matches（翻译记忆参考）和 terms（术语约束），核对时参考。"
+            "每条 entry 可能带有 tm_matches（翻译记忆参考）、tm_fragments（片段匹配参考）和 terms（术语约束），核对时参考。"
             "内联标签（<tag .../>）必须原样保留，数量与位置与 source 一致——丢失标签是最严重的错误。"
         )
         + ("发现问题直接修正，无需标注。" if review_only else "")
@@ -199,6 +199,8 @@ def _build_review_json(
             item["terms"] = e["terms"]
         if e.get("tm_matches"):
             item["tm_matches"] = e["tm_matches"]
+        if e.get("tm_fragments"):
+            item["tm_fragments"] = e["tm_fragments"]
         review_entries.append(item)
     review["entries"] = review_entries
     return review
@@ -413,6 +415,8 @@ def cmd_next(review_only: bool = False):
             item["terms"] = e["terms"]
         if e.get("tm_matches"):
             item["tm_matches"] = e["tm_matches"]
+        if e.get("tm_fragments"):
+            item["tm_fragments"] = e["tm_fragments"]
         # 混合文件支持：已有译文 → 锁定，空条目 → 待翻译
         if existing_target:
             item["target"] = existing_target
