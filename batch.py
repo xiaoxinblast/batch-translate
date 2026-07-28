@@ -100,6 +100,7 @@ def _enrich_working_json(json_path: Path, state: dict):
     terms_path = state.get("terms_path")
     if terms_path:
         try:
+            sys.path.insert(0, str(_SCRIPT_DIR))
             from term_base import TermBase
             tb = TermBase(terms_path)
             tb.load()
@@ -110,13 +111,16 @@ def _enrich_working_json(json_path: Path, state: dict):
                 terms = tb.find_terms(plain)
                 if terms:
                     e["terms"] = terms
-        except ImportError:
-            pass
+        except ImportError as e:
+            print(f"⚠️ term_base 导入失败，跳过术语增强: {e}")
+        except Exception as e:
+            print(f"⚠️ 术语增强过程出错，跳过: {e}")
 
     # TM
     tm_path = state.get("tm_path")
     if tm_path:
         try:
+            sys.path.insert(0, str(_SCRIPT_DIR))
             from tm_store import TranslationMemory
             tm = TranslationMemory(tm_path)
             import re
@@ -132,8 +136,10 @@ def _enrich_working_json(json_path: Path, state: dict):
                     frag_matches = tm.find_fragment_matches(plain, exclude_sources=exclude)
                     if frag_matches:
                         e["tm_fragments"] = frag_matches
-        except ImportError:
-            pass
+        except ImportError as e:
+            print(f"⚠️ tm_store 导入失败，跳过 TM 增强: {e}")
+        except Exception as e:
+            print(f"⚠️ TM 增强过程出错，跳过: {e}")
 
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
