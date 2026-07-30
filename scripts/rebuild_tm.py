@@ -22,12 +22,16 @@ EXPORT_NAMESPACE = 'urn:oasis:names:tc:xliff:document:1.2'
 def parse_file(file_path: Path, tmp_dir: Path) -> Path:
     """用 convert.py parse 解析任意格式到临时 JSON，返回 JSON 路径。"""
     output = tmp_dir / f"{file_path.stem}.json"
-    subprocess.run([
+    args = [
         sys.executable, str(SCRIPT_DIR / "convert.py"), "parse",
         str(file_path),
         "--output", str(output),
         "--output-dir", str(tmp_dir),
-    ], check=True, capture_output=True, text=True, encoding="utf-8")
+    ]
+    # xlsx/xlsm 无标准标题行 → header-row=0，不跳过任何行
+    if file_path.suffix.lower() in (".xlsx", ".xlsm"):
+        args += ["--header-row", "0"]
+    subprocess.run(args, check=True, capture_output=True, text=True, encoding="utf-8")
     return output
 
 
