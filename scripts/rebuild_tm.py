@@ -160,7 +160,7 @@ def main(src_dir: str, output: str, source_col: str = "", target_col: str = ""):
                     file_entries.append({
                         "source": src_text,
                         "target": tgt_text,
-                        "context": e.get("context", "") or e.get("note", "") or "",
+                        "context": e.get("context", "") or "",
                         "file": f.name,
                     })
 
