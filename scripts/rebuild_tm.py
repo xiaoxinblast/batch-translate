@@ -35,18 +35,18 @@ def _cell(row: tuple, idx: int) -> str:
         return ""
     return str(row[idx]).strip()
 
-def _detect_columns(ws, source_col: str, target_col: str) -> tuple[int, int]:
-    """检测源/译文列索引。若用户未指定，扫描首行自动识别。"""
+def _detect_columns(ws, source_col: str, target_col: str) -> tuple[int, int, int]:
+    """检测源/译文列索引和标题行号。若用户未指定，扫描前 5 行自动识别。
+    返回 (src_idx, tgt_idx, header_row)。header_row=0 表示未检测到标题行。"""
     import re
 
     if source_col and target_col:
-        return _col_idx(source_col), _col_idx(target_col)
+        return _col_idx(source_col), _col_idx(target_col), 0
 
-    # 扫描第一个非空行，按关键词匹配
     src_keywords = ["原文", "source", "ja", "jp", "日文", "日本語"]
     tgt_keywords = ["译文", "target", "zh", "sc", "cn", "中文", "簡体", "简体"]
 
-    for row in ws.iter_rows(min_row=1, max_row=min(5, ws.max_row or 5), values_only=True):
+    for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=min(5, ws.max_row or 5), values_only=True), 1):
         found = {}
         for ci, cv in enumerate(row):
             cvs = str(cv).strip().lower() if cv else ""
@@ -59,12 +59,11 @@ def _detect_columns(ws, source_col: str, target_col: str) -> tuple[int, int]:
         if "src" in found or "tgt" in found:
             src_i = found.get("src", 0)
             tgt_i = found.get("tgt", 1)
-            # 确保 src != tgt
             if src_i == tgt_i:
                 tgt_i = 1 if src_i != 1 else 2
-            return src_i, tgt_i
+            return src_i, tgt_i, row_idx
 
-    return _col_idx(source_col or "A"), _col_idx(target_col or "B")
+    return _col_idx(source_col or "A"), _col_idx(target_col or "B"), 0
 
 
 def extract_xlsx(file_path: Path, source_col: str = "", target_col: str = "") -> list[dict]:
@@ -73,11 +72,13 @@ def extract_xlsx(file_path: Path, source_col: str = "", target_col: str = "") ->
     wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
     ws = wb.active
 
-    src_idx, tgt_idx = _detect_columns(ws, source_col, target_col)
+    src_idx, tgt_idx, header_row = _detect_columns(ws, source_col, target_col)
     max_col = max(src_idx, tgt_idx) + 1
 
     entries = []
     for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_col=max_col, values_only=True), 1):
+        if header_row and row_idx <= header_row:
+            continue  # 跳过标题行及其之前的元数据行
         src = _cell(row, src_idx)
         tgt = _cell(row, tgt_idx)
         if not src or not tgt:
@@ -165,7 +166,10 @@ def main(src_dir: str, output: str, source_col: str = "", target_col: str = ""):
 
             tm.add(file_entries, dedup=True)
             total_pairs += len(file_entries)
-            print(f"   {f.name}: {line_count} 条 → 提取 {len(file_entries)} 对")
+            status = f"{f.name}: {line_count} 条 → 提取 {len(file_entries)} 对"
+            if len(file_entries) == 0 and f.suffix.lower() not in XLSX_EXTS:
+                status += " ⚠️ 非 mqxliff 格式可能不提取译文，请用 --source-col/--target-col 或转为 mqxliff"
+            print(f"   {status}")
 
     tm.save()
     size_mb = out.stat().st_size / (1024 * 1024)
