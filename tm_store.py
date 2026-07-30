@@ -60,7 +60,7 @@ class TranslationMemory:
         for e in self._entries:
             ep = self._tag_re.sub("", e["source"]); m.set_seq2(ep)
             r = m.ratio()
-            if r >= threshold: s.append({"source": e["source"], "target": e["target"], "similarity": round(r, 4), "context": e.get("context", ""), "_c": _ctx(e.get("context", ""))})
+            if r >= threshold: s.append({"source": e["source"], "target": e["target"], "similarity": round(r, 4), "context": e.get("context", ""), "file": e.get("file", ""), "_c": _ctx(e.get("context", ""))})
         s.sort(key=lambda x: (-x["similarity"], -x["_c"]))
         for x in s: del x["_c"]
         return s[:top_n]
@@ -144,9 +144,10 @@ class TranslationMemory:
                 if overlap > existing.get("_overlap", 0):
                     existing["match_source"] = e["source"]
                     existing["match_target"] = e["target"]
+                    existing["match_file"] = e.get("file", "")
                     existing["_overlap"] = overlap
                 continue
-            results.append({"fragment_source": fs, "match_source": e["source"], "match_target": e["target"], "_overlap": overlap})
+            results.append({"fragment_source": fs, "match_source": e["source"], "match_target": e["target"], "match_file": e.get("file", ""), "_overlap": overlap})
         for r in results: del r["_overlap"]
         # 包含去重
         filtered = [r for r in results
