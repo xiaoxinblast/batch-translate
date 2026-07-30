@@ -2,8 +2,9 @@
 """用 translate 工作流的 parse 管线从已翻译批次重建 TM。
 
 流程：
-  1. convert.py parse 每个文件（mqxliff/xlsx/docx/txt等）→ JSON（tag 规范化、文本抽取与工作流一致）
-  2. 从 JSON entries 提取 source/target → TranslationMemory.add()
+  1. mqxliff/docx/txt → convert.py parse → JSON
+     xlsx/xlsm → openpyxl 直接读（parser 不提取 target 列）
+  2. 从 entries 提取 source/target → TranslationMemory.add()
   3. 保存 TM
 """
 import sys, json, subprocess, tempfile
@@ -16,34 +17,107 @@ SCRIPT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 from tm_store import TranslationMemory
 
-EXPORT_NAMESPACE = 'urn:oasis:names:tc:xliff:document:1.2'
+XLSX_EXTS = {".xlsx", ".xlsm"}
+PIPELINE_EXTS = {".mqxliff", ".docx", ".txt", ".csv", ".tsv"}
 
 
-def parse_file(file_path: Path, tmp_dir: Path) -> Path:
-    """用 convert.py parse 解析任意格式到临时 JSON，返回 JSON 路径。"""
+# ── xlsx/xlsm 直接提取 ────────────────────────────────────────────
+
+def _col_idx(letter: str) -> int:
+    """A→0, B→1, ..."""
+    r = 0
+    for c in letter.upper():
+        r = r * 26 + (ord(c) - ord("A") + 1)
+    return r - 1
+
+def _cell(row: tuple, idx: int) -> str:
+    if idx >= len(row) or row[idx] is None:
+        return ""
+    return str(row[idx]).strip()
+
+def _detect_columns(ws, source_col: str, target_col: str) -> tuple[int, int]:
+    """检测源/译文列索引。若用户未指定，扫描首行自动识别。"""
+    import re
+
+    if source_col and target_col:
+        return _col_idx(source_col), _col_idx(target_col)
+
+    # 扫描第一个非空行，按关键词匹配
+    src_keywords = ["原文", "source", "ja", "jp", "日文", "日本語"]
+    tgt_keywords = ["译文", "target", "zh", "sc", "cn", "中文", "簡体", "简体"]
+
+    for row in ws.iter_rows(min_row=1, max_row=min(5, ws.max_row or 5), values_only=True):
+        found = {}
+        for ci, cv in enumerate(row):
+            cvs = str(cv).strip().lower() if cv else ""
+            for kw in src_keywords:
+                if kw in cvs:
+                    found.setdefault("src", ci)
+            for kw in tgt_keywords:
+                if kw in cvs and ci != found.get("src"):
+                    found.setdefault("tgt", ci)
+        if "src" in found or "tgt" in found:
+            src_i = found.get("src", 0)
+            tgt_i = found.get("tgt", 1)
+            # 确保 src != tgt
+            if src_i == tgt_i:
+                tgt_i = 1 if src_i != 1 else 2
+            return src_i, tgt_i
+
+    return _col_idx(source_col or "A"), _col_idx(target_col or "B")
+
+
+def extract_xlsx(file_path: Path, source_col: str = "", target_col: str = "") -> list[dict]:
+    """从 xlsx/xlsm 直接提取 source/target 对。"""
+    import openpyxl
+    wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+    ws = wb.active
+
+    src_idx, tgt_idx = _detect_columns(ws, source_col, target_col)
+    max_col = max(src_idx, tgt_idx) + 1
+
+    entries = []
+    for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_col=max_col, values_only=True), 1):
+        src = _cell(row, src_idx)
+        tgt = _cell(row, tgt_idx)
+        if not src or not tgt:
+            continue
+        entries.append({
+            "source": src,
+            "target": tgt,
+            "context": f"{file_path.name}:Row{row_idx}",
+            "file": file_path.name,
+        })
+
+    wb.close()
+    return entries
+
+
+# ── 通用 parse 管线（mqxliff/docx/txt 等） ────────────────────────
+
+def parse_via_convert(file_path: Path, tmp_dir: Path) -> Path:
+    """用 convert.py parse → JSON。"""
     output = tmp_dir / f"{file_path.stem}.json"
-    args = [
+    subprocess.run([
         sys.executable, str(SCRIPT_DIR / "convert.py"), "parse",
         str(file_path),
         "--output", str(output),
         "--output-dir", str(tmp_dir),
-    ]
-    # xlsx/xlsm 无标准标题行 → header-row=0，不跳过任何行
-    if file_path.suffix.lower() in (".xlsx", ".xlsm"):
-        args += ["--header-row", "0"]
-    subprocess.run(args, check=True, capture_output=True, text=True, encoding="utf-8")
+    ], check=True, capture_output=True, text=True, encoding="utf-8")
     return output
 
 
-def main(src_dir: str, output: str):
+# ── 主流程 ─────────────────────────────────────────────────────────
+
+def main(src_dir: str, output: str, source_col: str = "", target_col: str = ""):
     src = Path(src_dir)
     out = Path(output)
     if not src.is_dir():
         print(f"❌ 目录不存在: {src}")
         sys.exit(1)
 
-    extensions = [".mqxliff", ".xlsx", ".xlsm", ".docx", ".txt", ".csv", ".tsv"]
-    files = sorted([f for ext in extensions for f in src.glob(f"*{ext}")],
+    all_exts = list(PIPELINE_EXTS | XLSX_EXTS)
+    files = sorted([f for ext in all_exts for f in src.glob(f"*{ext}")],
                    key=lambda f: f.name)
     if not files:
         print(f"❌ 目录中没有支持的文件: {src}")
@@ -54,38 +128,44 @@ def main(src_dir: str, output: str):
     tm = TranslationMemory(str(out.resolve()))
     tm._entries = []
     tm._loaded = True
-
     total_pairs = 0
 
     with tempfile.TemporaryDirectory(prefix="tm_rebuild_") as tmp_dir:
         tmp = Path(tmp_dir)
         for f in files:
-            try:
-                json_path = parse_file(f, tmp)
-            except subprocess.CalledProcessError as e:
-                print(f"   ⚠️ {f.name}: parse 失败，跳过 → {e.stderr[:120]}")
-                continue
-
-            with open(json_path, "r", encoding="utf-8") as jf:
-                data = json.load(jf)
-
-            entries = data.get("entries", [])
             file_entries = []
-            for e in entries:
-                src_text = (e.get("source") or "").strip()
-                tgt_text = (e.get("target") or "").strip()
-                if not src_text or not tgt_text:
+            line_count = 0
+
+            if f.suffix.lower() in XLSX_EXTS:
+                # xlsx/xlsm：直接读
+                file_entries = extract_xlsx(f, source_col, target_col)
+                line_count = len(file_entries)
+            else:
+                # mqxliff/docx/txt：走 convert.py parse 管线
+                try:
+                    json_path = parse_via_convert(f, tmp)
+                except subprocess.CalledProcessError as e:
+                    print(f"   ⚠️ {f.name}: parse 失败，跳过")
                     continue
-                file_entries.append({
-                    "source": src_text,
-                    "target": tgt_text,
-                    "context": e.get("context", "") or e.get("note", "") or "",
-                    "file": f.name,
-                })
+                with open(json_path, "r", encoding="utf-8") as jf:
+                    data = json.load(jf)
+                entries = data.get("entries", [])
+                line_count = len(entries)
+                for e in entries:
+                    src_text = (e.get("source") or "").strip()
+                    tgt_text = (e.get("target") or "").strip()
+                    if not src_text or not tgt_text:
+                        continue
+                    file_entries.append({
+                        "source": src_text,
+                        "target": tgt_text,
+                        "context": e.get("context", "") or e.get("note", "") or "",
+                        "file": f.name,
+                    })
 
             tm.add(file_entries, dedup=True)
             total_pairs += len(file_entries)
-            print(f"   {f.name}: {len(entries)} 条 → 提取 {len(file_entries)} 对")
+            print(f"   {f.name}: {line_count} 条 → 提取 {len(file_entries)} 对")
 
     tm.save()
     size_mb = out.stat().st_size / (1024 * 1024)
@@ -97,9 +177,11 @@ def main(src_dir: str, output: str):
 
 if __name__ == "__main__":
     import argparse
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="从已翻译批次重建翻译记忆")
     p.add_argument("src_dir", help="已翻译批次目录")
     p.add_argument("--output", "-o", default="batch_translate/data/tm_memory.json",
                    help="输出 TM JSON 路径")
+    p.add_argument("--source-col", default="", help="xlsx 源列字母（默认自动检测）")
+    p.add_argument("--target-col", default="", help="xlsx 译文列字母（默认自动检测）")
     args = p.parse_args()
-    main(args.src_dir, args.output)
+    main(args.src_dir, args.output, args.source_col, args.target_col)
