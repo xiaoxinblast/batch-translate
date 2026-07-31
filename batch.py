@@ -2,7 +2,7 @@
 """
 批量翻译工作流：export → 分批发给 AI → 合并 → import → 循环
 用法:
-  python batch_translate/batch.py init <mqxliff> --batch-size 30 --context-size 5 ...
+  python batch_translate/batch.py init <mqxliff> --batch-chars 3000 --context-size 5 ...
   python batch_translate/batch.py next
   python batch_translate/batch.py submit <result.json>
 """
@@ -192,11 +192,16 @@ def _build_review_json(
 
     review_entries = []
     for e in entries:
+        translated = e.get("translated", e.get("target", ""))
         item = {
             "id": e["id"],
             "source": e["source"],
-            "translated": e.get("translated", e.get("target", "")),
+            "translated": translated,
         }
+        if "locked" in e:
+            item["locked"] = bool(e["locked"])
+        else:
+            item["locked"] = bool(str(translated).strip())
         if e.get("context"):
             item["context"] = e["context"]
         if e.get("note"):

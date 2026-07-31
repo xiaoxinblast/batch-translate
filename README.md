@@ -1,18 +1,18 @@
-# batch-translate — 批量翻译工作流
+# batch-translate — 批量翻译工作流（Reasonix / Codex 通用工具包）
 
-配合 Reasonix Skill 使用的批量翻译工具，支持 日→中 翻译 + 校对 全自动循环。
+配合 batch-translate Skill 使用的批量翻译工具，支持 Reasonix 与 Codex；日→中 翻译 + 校对 全自动循环。
 
 ## 支持格式
 
-mqxliff（MemoQ） · docx · xlsx · txt · csv · tsv
+mqxliff（MemoQ） · docx · xlsx · xlsm · txt · csv/tsv（按整行处理）
 
 ## 快速开始
 
-**前置：** 安装 Reasonix Skill → [batch-translate-skill](https://github.com/xiaoxinblast/batch-translate-skill)，然后对话：
+**前置：** 安装技能：Reasonix 用 [batch-translate-skill](https://github.com/xiaoxinblast/batch-translate-skill)，Codex 用 [batch-translate-skill-codex](https://github.com/xiaoxinblast/batch-translate-skill-codex)，然后对话：
 
 > "开始批量翻译"
 
-Reasonix 会自动完成：初始化 → 语境分析 → 翻译 → 校对 → 写回，全部自动化。
+技能会自动完成：初始化 → 语境分析 → 翻译 → 校对 → 写回，全部自动化。
 
 ## 手动使用
 
@@ -71,5 +71,13 @@ python batch_translate/batch.py next --review  # 仅校对模式（已有译文�
 ## 依赖
 
 ```bash
-pip install lxml openpyxl python-docx
+python -m pip install -r requirements.txt
+```
+
+内容：`lxml`、`openpyxl`、`python-docx`。脚本已内置 Windows UTF-8 输出处理，路径含中文/空格也可直接使用。
+
+## 测试
+
+```bash
+python -m unittest discover -s tests
 ```
