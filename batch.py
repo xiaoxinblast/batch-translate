@@ -861,6 +861,7 @@ def cmd_term_gaps(stem_arg: Optional[str], out_arg: Optional[str]):
     if start == -1:
         section = "(未找到术语缺口小节)"
     else:
+        start = text.rfind("\n", 0, start) + 1  # 从该小节的标题行行首开始
         rest = text[start:]
         end = len(rest)
         for sep in ("\n## ", "\n==== "):
