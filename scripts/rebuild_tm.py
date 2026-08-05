@@ -8,6 +8,7 @@
   3. 保存 TM
 """
 import sys, json, subprocess, tempfile
+import re
 from pathlib import Path
 
 if sys.platform == "win32":
@@ -35,44 +36,114 @@ def _cell(row: tuple, idx: int) -> str:
         return ""
     return str(row[idx]).strip()
 
-def _detect_columns(ws, source_col: str, target_col: str) -> tuple[int, int, int]:
-    """检测源/译文列索引和标题行号。若用户未指定，扫描前 5 行自动识别。
-    返回 (src_idx, tgt_idx, header_row)。header_row=0 表示未检测到标题行。"""
-    import re
+_SRC_KEYWORDS = ["原文", "source", "ja", "jp", "日文", "日本語"]
+_TGT_KEYWORDS = ["译文", "target", "zh", "sc", "cn", "中文", "簡体", "简体"]
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+_TIME_RE = re.compile(r"^\d{2}:\d{2}")
 
-    if source_col and target_col:
-        return _col_idx(source_col), _col_idx(target_col), 0
 
-    src_keywords = ["原文", "source", "ja", "jp", "日文", "日本語"]
-    tgt_keywords = ["译文", "target", "zh", "sc", "cn", "中文", "簡体", "简体"]
-
-    for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=min(5, ws.max_row or 5), values_only=True), 1):
-        found = {}
+def _header_scan(ws) -> tuple[int, list[int], list[int]]:
+    """扫描前 5 行，返回 (header_row, 源候选列, 译文候选列)。
+    header_row=0 表示未识别到表头。"""
+    for row_idx, row in enumerate(
+        ws.iter_rows(min_row=1, max_row=min(5, ws.max_row or 5), values_only=True), 1
+    ):
+        src_cands = []
+        tgt_cands = []
         for ci, cv in enumerate(row):
             cvs = str(cv).strip().lower() if cv else ""
-            for kw in src_keywords:
-                if kw in cvs:
-                    found.setdefault("src", ci)
-            for kw in tgt_keywords:
-                if kw in cvs and ci != found.get("src"):
-                    found.setdefault("tgt", ci)
-        if "src" in found or "tgt" in found:
-            src_i = found.get("src", 0)
-            tgt_i = found.get("tgt", 1)
-            if src_i == tgt_i:
-                tgt_i = 1 if src_i != 1 else 2
-            return src_i, tgt_i, row_idx
-
-    return _col_idx(source_col or "A"), _col_idx(target_col or "B"), 0
+            if any(kw in cvs for kw in _SRC_KEYWORDS):
+                src_cands.append(ci)
+            elif any(kw in cvs for kw in _TGT_KEYWORDS):
+                tgt_cands.append(ci)
+        if src_cands or tgt_cands:
+            return row_idx, src_cands, tgt_cands
+    return 0, [], []
 
 
-def extract_xlsx(file_path: Path, source_col: str = "", target_col: str = "") -> list[dict]:
+def _pick_clean_source_col(ws, candidates: list[int], header_row: int) -> int | None:
+    """在候选源列中选“干净文本列”：全表统计，注释/日期单元格计罚分，
+    罚分最低者胜出；平局时数据行多者胜，再平局取最左列。无候选返回 None。"""
+    if not candidates:
+        return None
+    start = header_row + 1 if header_row else 1
+    scores = {ci: {"comment": 0, "datetime": 0, "nonempty": 0} for ci in candidates}
+    for row_idx, row in enumerate(ws.iter_rows(min_row=start, values_only=True), start):
+        for ci in candidates:
+            v = _cell(row, ci)
+            if not v:
+                continue
+            s = scores[ci]
+            s["nonempty"] += 1
+            if v.startswith("#") or v.startswith("//"):
+                s["comment"] += 1
+            elif _DATE_RE.match(v) or _TIME_RE.match(v):
+                s["datetime"] += 1
+    best = None
+    best_penalty = None
+    best_nonempty = None
+    for ci in candidates:
+        s = scores[ci]
+        if s["nonempty"] == 0:
+            penalty = 10 ** 9
+        else:
+            penalty = s["comment"] + s["datetime"]
+        if best is None or penalty < best_penalty or (
+            penalty == best_penalty and s["nonempty"] > best_nonempty
+        ):
+            best = ci
+            best_penalty = penalty
+            best_nonempty = s["nonempty"]
+    return best
+
+
+def _detect_columns(
+    ws,
+    source_col: str = "",
+    target_col: str = "",
+    header_row: int | None = None,
+    clean_source: bool = False,
+) -> tuple[int, int, int]:
+    """检测源/译文列索引和表头行号。
+    返回 (src_idx, tgt_idx, header_row)。header_row=0 表示无表头。
+    - 显式列与自动列都会扫描前 5 行识别表头（除非 header_row 显式传入）
+    - clean_source=True 时忽略 source_col，自动选无注释/日期的干净源列
+    """
+    detected_header, src_cands, tgt_cands = _header_scan(ws)
+    if header_row is None:
+        header_row = detected_header
+
+    if clean_source:
+        src_idx = _pick_clean_source_col(ws, src_cands, header_row)
+        if src_idx is None:
+            src_idx = _col_idx(source_col or "A")
+    else:
+        src_idx = _col_idx(source_col) if source_col else (src_cands[0] if src_cands else 0)
+
+    if target_col:
+        tgt_idx = _col_idx(target_col)
+    else:
+        tgt_idx = tgt_cands[0] if tgt_cands else (1 if src_idx != 1 else 2)
+    if src_idx == tgt_idx:
+        tgt_idx = 1 if src_idx != 1 else 2
+    return src_idx, tgt_idx, header_row
+
+
+def extract_xlsx(
+    file_path: Path,
+    source_col: str = "",
+    target_col: str = "",
+    header_row: int | None = None,
+    clean_source: bool = False,
+) -> list[dict]:
     """从 xlsx/xlsm 直接提取 source/target 对。"""
     import openpyxl
     wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
     ws = wb.active
 
-    src_idx, tgt_idx, header_row = _detect_columns(ws, source_col, target_col)
+    src_idx, tgt_idx, header_row = _detect_columns(
+        ws, source_col, target_col, header_row=header_row, clean_source=clean_source
+    )
     max_col = max(src_idx, tgt_idx) + 1
 
     entries = []
@@ -110,7 +181,14 @@ def parse_via_convert(file_path: Path, tmp_dir: Path) -> Path:
 
 # ── 主流程 ─────────────────────────────────────────────────────────
 
-def main(src_dir: str, output: str, source_col: str = "", target_col: str = ""):
+def main(
+    src_dir: str,
+    output: str,
+    source_col: str = "",
+    target_col: str = "",
+    header_row: int | None = None,
+    clean_source: bool = False,
+):
     src = Path(src_dir)
     out = Path(output)
     if not src.is_dir():
@@ -139,7 +217,10 @@ def main(src_dir: str, output: str, source_col: str = "", target_col: str = ""):
 
             if f.suffix.lower() in XLSX_EXTS:
                 # xlsx/xlsm：直接读
-                file_entries = extract_xlsx(f, source_col, target_col)
+                file_entries = extract_xlsx(
+                    f, source_col, target_col,
+                    header_row=header_row, clean_source=clean_source,
+                )
                 line_count = len(file_entries)
             else:
                 # mqxliff/docx/txt：走 convert.py parse 管线
@@ -187,5 +268,10 @@ if __name__ == "__main__":
                    help="输出 TM JSON 路径")
     p.add_argument("--source-col", default="", help="xlsx 源列字母（默认自动检测）")
     p.add_argument("--target-col", default="", help="xlsx 译文列字母（默认自动检测）")
+    p.add_argument("--header-row", type=int, default=None,
+                   help="xlsx 表头行号（默认自动检测；0=无表头）")
+    p.add_argument("--clean-source", action="store_true",
+                   help="自动选择无注释/日期的干净源列（忽略 --source-col）")
     args = p.parse_args()
-    main(args.src_dir, args.output, args.source_col, args.target_col)
+    main(args.src_dir, args.output, args.source_col, args.target_col,
+         header_row=args.header_row, clean_source=args.clean_source)

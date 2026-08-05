@@ -9,6 +9,8 @@
 
 import argparse
 import json
+import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Optional
@@ -36,6 +38,18 @@ def _set_active_stem(stem: str):
     """设置当前活动的项目 stem。"""
     _ACTIVE_PROJECT.parent.mkdir(parents=True, exist_ok=True)
     _ACTIVE_PROJECT.write_text(stem, encoding="utf-8")
+
+
+def _resolve_stem(stem_arg: Optional[str]) -> str:
+    """返回 --stem 参数或 .active_project 中的 stem。"""
+    if stem_arg:
+        return stem_arg
+    if _ACTIVE_PROJECT.is_file():
+        stem = _ACTIVE_PROJECT.read_text(encoding="utf-8").strip()
+        if stem:
+            return stem
+    print("❌ 未指定 --stem 且 data/.active_project 不可用")
+    sys.exit(1)
 
 
 def _load_state() -> dict:
@@ -778,6 +792,92 @@ def cmd_retry():
     cmd_next()
 
 
+def cmd_summary(report_file: Path, stem_arg: Optional[str]):
+    """把语境分析报告写入 batch_state.json 的 document_summary，并保留 sidecar。"""
+    if not report_file.is_file():
+        print(f"❌ 报告文件不存在: {report_file}")
+        sys.exit(1)
+    stem = _resolve_stem(stem_arg)
+    text = report_file.read_text(encoding="utf-8")
+
+    state_path = _SCRIPT_DIR / "data" / stem / "batch_state.json"
+    if state_path.is_file():
+        with open(state_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        state["document_summary"] = text
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        print(f"✅ document_summary 已写入: {state_path}")
+    else:
+        print(f"⚠️ 状态文件不存在（未 init 或已完成清理），仅写 sidecar: {state_path}")
+
+    sidecar = _SCRIPT_DIR / "exports" / stem / "document_summary.md"
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(text, encoding="utf-8")
+    print(f"📄 sidecar 已写入: {sidecar}")
+
+
+def cmd_export(stem_arg: Optional[str], out_arg: Optional[str], force: bool):
+    """导出最终译文 mqxliff（默认复制到项目 已交付/ 目录）。"""
+    stem = _resolve_stem(stem_arg)
+    src = _SCRIPT_DIR / "data" / stem / f"_working_{stem}.mqxliff"
+    if not src.is_file():
+        print(f"❌ 工作 mqxliff 不存在: {src}")
+        sys.exit(1)
+
+    if out_arg:
+        dst = Path(out_arg)
+    else:
+        dst = _SCRIPT_DIR.parent / "已交付" / f"{stem}.mqxliff"
+    if dst.is_file() and not force:
+        print(f"❌ 目标已存在（加 --force 覆盖）: {dst}")
+        sys.exit(1)
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    print(f"✅ 已导出: {dst}")
+
+
+def cmd_term_gaps(stem_arg: Optional[str], out_arg: Optional[str]):
+    """从 document_summary 提取“疑似术语库未覆盖的专名”小节，生成待确认清单。"""
+    stem = _resolve_stem(stem_arg)
+    sidecar = _SCRIPT_DIR / "exports" / stem / "document_summary.md"
+    if sidecar.is_file():
+        text = sidecar.read_text(encoding="utf-8")
+    else:
+        batch_file = _SCRIPT_DIR / "exports" / stem / "_batch_001_to_translate.json"
+        if not batch_file.is_file():
+            print(f"❌ 找不到 document_summary：{sidecar} 与 {batch_file} 均不存在")
+            sys.exit(1)
+        with open(batch_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        text = data.get("document_summary") or ""
+        if not text:
+            print(f"❌ {batch_file} 中没有 document_summary")
+            sys.exit(1)
+
+    marker = "疑似术语库未覆盖的专名"
+    start = text.find(marker)
+    if start == -1:
+        section = "(未找到术语缺口小节)"
+    else:
+        rest = text[start:]
+        end = len(rest)
+        for sep in ("\n## ", "\n==== "):
+            i = rest.find(sep)
+            if i != -1:
+                end = min(end, i)
+        section = rest[:end].strip()
+
+    if out_arg:
+        out = Path(out_arg)
+    else:
+        out = _SCRIPT_DIR.parent / "_temp" / f"term_gaps_{stem}.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(f"# 术语缺口待确认清单（{stem}）\n\n{section}\n", encoding="utf-8")
+    print(f"✅ 术语缺口清单已生成: {out}")
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════════════════
@@ -805,6 +905,21 @@ def main():
     p_submit.add_argument("result", type=str, help="校对后的结果 JSON 路径")
     p_status = sub.add_parser("status", help="查看进度")
     p_retry = sub.add_parser("retry", help="重新生成当前批次翻译 JSON")
+    p_summary = sub.add_parser("summary", help="写入语境分析报告到 document_summary")
+    p_summary.add_argument("report", type=str, help="报告文件路径（UTF-8 文本）")
+    p_summary.add_argument("--stem", type=str, default=None,
+                           help="项目 stem（默认 data/.active_project）")
+    p_export = sub.add_parser("export", help="导出最终译文 mqxliff")
+    p_export.add_argument("--stem", type=str, default=None,
+                          help="项目 stem（默认 data/.active_project）")
+    p_export.add_argument("--out", type=str, default=None,
+                          help="输出路径（默认 已交付/<stem>.mqxliff）")
+    p_export.add_argument("--force", action="store_true", help="覆盖已存在的目标文件")
+    p_gaps = sub.add_parser("term-gaps", help="生成术语缺口待确认清单")
+    p_gaps.add_argument("--stem", type=str, default=None,
+                        help="项目 stem（默认 data/.active_project）")
+    p_gaps.add_argument("--out", type=str, default=None,
+                        help="输出路径（默认 _temp/term_gaps_<stem>.md）")
 
     args = parser.parse_args()
 
@@ -830,6 +945,12 @@ def main():
         cmd_status()
     elif args.command == "retry":
         cmd_retry()
+    elif args.command == "summary":
+        cmd_summary(Path(args.report), args.stem)
+    elif args.command == "export":
+        cmd_export(args.stem, args.out, args.force)
+    elif args.command == "term-gaps":
+        cmd_term_gaps(args.stem, args.out)
     else:
         parser.print_help()
 
