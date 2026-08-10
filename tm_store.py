@@ -17,6 +17,7 @@ class TranslationMemory:
         self._loaded = False
         self._ngram_index: dict[str, set[int]] = {}
         self._ngram2_index: dict[str, set[int]] = {}
+        self._norm_lens: list[int] = []
 
     # ── 加载 / 保存 ───────────────────────────────────────────────
 
@@ -36,28 +37,44 @@ class TranslationMemory:
 
     def add(self, entries: list[dict], dedup: bool = True):
         self.load()
+        added: list[dict] = []
         if dedup:
             existing = {(e["source"], e.get("context", "")) for e in self._entries}
             for e in entries:
                 k = (e.get("source", "").strip(), e.get("context", "").strip())
                 if k not in existing:
-                    self._entries.append({"source": e.get("source", ""), "target": e.get("target", ""), "context": e.get("context", ""), "file": e.get("file", "")})
+                    entry = {"source": e.get("source", ""), "target": e.get("target", ""), "context": e.get("context", ""), "file": e.get("file", "")}
+                    self._entries.append(entry)
                     existing.add(k)
+                    added.append(entry)
         else:
             self._entries.extend(entries)
+            added = list(entries)
+        if added:
+            self._index_entries(range(len(self._entries) - len(added), len(self._entries)))
 
     # ── 模糊检索 ──────────────────────────────────────────────────
 
     _tag_re = re.compile(r"<[^>]+>")
 
-    def find_matches(self, source: str, threshold: float = 0.6, top_n: int = 3, query_context: str = "") -> list[dict]:
+    def find_matches(
+        self, source: str, threshold: float = 0.6, top_n: int = 3,
+        query_context: str = "", pool3: int = 300, pool2: int = 500,
+        full_scan_len: int = 6,
+    ) -> list[dict]:
         self.load()
         if not self._entries or not source: return []
         qp = self._tag_re.sub("", source)
         def _ctx(c): return sum(1 for q, c2 in zip(query_context.split("."), c.split(".")) if q == c2) if query_context and c else 0
+        plain = self._normalize(source)
+        if len(self._ngram_skip_re.sub("", plain)) <= full_scan_len:
+            cand_ids = range(len(self._entries))
+        else:
+            cand_ids = self._recall_candidate_ids(source, pool3, pool2)
         s = []
         m = SequenceMatcher(a=qp)
-        for e in self._entries:
+        for i in cand_ids:
+            e = self._entries[i]
             ep = self._tag_re.sub("", e["source"]); m.set_seq2(ep)
             r = m.ratio()
             if r >= threshold: s.append({"source": e["source"], "target": e["target"], "similarity": round(r, 4), "context": e.get("context", ""), "file": e.get("file", ""), "_c": _ctx(e.get("context", ""))})
@@ -84,13 +101,38 @@ class TranslationMemory:
 
     def _build_ngram_index(self):
         self._ngram_index.clear(); self._ngram2_index.clear()
-        for idx, entry in enumerate(self._entries):
+        self._norm_lens.clear()
+        self._index_entries(range(len(self._entries)))
+
+    def _index_entries(self, idxs):
+        for idx in idxs:
+            entry = self._entries[idx]
             plain = self._normalize(entry["source"])
+            self._norm_lens.append(len(plain))
             for seg in self._ngram_skip_re.split(plain):
                 if len(seg) < 2: continue
                 if len(seg) >= 3:
                     for i in range(len(seg) - 2): self._ngram_index.setdefault(seg[i:i+3], set()).add(idx)
                 for i in range(len(seg) - 1): self._ngram2_index.setdefault(seg[i:i+2], set()).add(idx)
+
+    def _top_ngram_ids(self, text: str, n: int, limit: int) -> list[int]:
+        """按 n-gram 命中计数取 top limit 个条目 id；同计数短条目优先（贴近 ratio）。"""
+        grams = self._extract_ngrams(text, n=n)
+        if not grams:
+            return []
+        idx = self._ngram_index if n == 3 else self._ngram2_index
+        counts: dict[int, int] = {}
+        for g in sorted(grams):  # 确定性：避免 set 哈希随机化影响截断边界
+            for i in sorted(idx.get(g, ())):
+                counts[i] = counts.get(i, 0) + 1
+        return sorted(counts, key=lambda i: (-counts[i], self._norm_lens[i]))[:limit]
+
+    def _recall_candidate_ids(self, source: str, pool3: int = 300, pool2: int = 500) -> list[int]:
+        """3-gram 与 2-gram 各取候选池并集（2-gram 兜底短词/子串）。"""
+        c3 = self._top_ngram_ids(source, 3, pool3)
+        c2 = self._top_ngram_ids(source, 2, pool2)
+        # 有序列表：同分条目保持与全量扫描一致的原始条目顺序
+        return sorted(set(c3) | set(c2))
 
     def _extract_ngrams(self, text: str, n: int = 3) -> set[str]:
         plain = self._normalize(text)
@@ -114,7 +156,7 @@ class TranslationMemory:
 
         def _get(ngram_idx, grams):
             cs: dict[int, int] = {}
-            for g in grams:
+            for g in sorted(grams):  # 确定性：同计数候选顺序稳定
                 for idx in ngram_idx.get(g, ()): cs[idx] = cs.get(idx, 0) + 1
             return cs
 
