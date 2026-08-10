@@ -32,6 +32,8 @@ python batch_translate/batch.py submit <校对结果.json>
 # 其他
 python batch_translate/batch.py status    # 查看进度
 python batch_translate/batch.py next --review  # 仅校对模式（已有译文）
+# 续跑/复跑：从带已有译文的 mqxliff 重新初始化（状态已存在则不覆盖，直接 next 继续）
+python batch_translate/batch.py init <已交付/xxx.mqxliff> --resume
 ```
 
 ## 项目文件

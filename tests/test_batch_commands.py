@@ -11,6 +11,18 @@ sys.path.insert(0, str(ROOT))
 
 import batch
 
+_MINI_MQ = """<?xml version='1.0' encoding='UTF-8'?>
+<xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:mq="MQXliff" version="1.2">
+<file original="t" source-language="ja" target-language="zh-cn" datatype="x-memoq">
+<body>
+<trans-unit id="1" mq:status="Pretranslated" mq:locked="no">
+<source xml:space="preserve">こんにちは</source>
+<target xml:space="preserve">你好</target>
+</trans-unit>
+</body>
+</file>
+</xliff>"""
+
 
 class BatchCommandsTest(unittest.TestCase):
     STEM = "Test_Stem"
@@ -34,7 +46,7 @@ class BatchCommandsTest(unittest.TestCase):
             encoding="utf-8",
         )
         mq = bt / "data" / cls.STEM / f"_working_{cls.STEM}.mqxliff"
-        mq.write_text("MQXLIFF-DATA", encoding="utf-8")
+        mq.write_text(_MINI_MQ, encoding="utf-8")
         batch._SCRIPT_DIR = bt
         batch._ACTIVE_PROJECT = bt / "data" / ".active_project"
 
@@ -89,7 +101,7 @@ class BatchCommandsTest(unittest.TestCase):
             dst.unlink()
         batch.cmd_export(None, None, False)
         self.assertTrue(dst.is_file())
-        self.assertEqual(dst.read_text(encoding="utf-8"), "MQXLIFF-DATA")
+        self.assertEqual(dst.read_text(encoding="utf-8"), _MINI_MQ)
 
     def test_export_refuses_overwrite_without_force(self):
         dst = Path(self._tmp.name) / "已交付" / f"{self.STEM}.mqxliff"
@@ -98,7 +110,7 @@ class BatchCommandsTest(unittest.TestCase):
             batch.cmd_export(None, None, False)
         self.assertEqual(dst.read_text(encoding="utf-8"), "OLD")
         batch.cmd_export(None, None, True)
-        self.assertEqual(dst.read_text(encoding="utf-8"), "MQXLIFF-DATA")
+        self.assertEqual(dst.read_text(encoding="utf-8"), _MINI_MQ)
 
     def test_export_custom_out(self):
         out = Path(self._tmp.name) / "_temp" / "custom.mqxliff"

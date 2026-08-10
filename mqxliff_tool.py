@@ -10,6 +10,7 @@ mqxliff 解析/写回工具
 
 import argparse
 import copy
+import html
 import json
 import re
 import sys
@@ -268,67 +269,86 @@ def _decode_bpt_ept_to_tag(elem, elem_type: str) -> InlineTag:
 # <tag/> → <ph>/<bpt>/<ept> 编码（写回用）
 # ═══════════════════════════════════════════════════════════════════════
 
-def _replace_tags_with_ph(text: str, tag_map: dict[str, InlineTag]) -> str:
+def _normalize_bare_tags(text: str, tag_map: dict[str, InlineTag]) -> str:
     """
-    将 text 中的 <tag id='N' ... /> 替换回原始 XLIFF 元素 XML（ph/bpt/ept）。
-    返回的字符串是多个 text + XML 片段的混合（XLIFF mixed content）。
+    将 Agent 可能输出的裸标签（<actor>、<button=L1> 等）转回 <tag> 格式。
+    裸标签是合理行为（更可读），但写回 mqxliff 时需要还原为 ph 元素。
     """
-    # ═══════════════════════════════════════════════════════════════════
-    # 预处理：将 Agent 可能输出的裸标签（<actor>、<button=L1> 等）转回 <tag> 格式
-    # Agent 输出裸标签是合理行为（更可读），但写回 mqxliff 时需要还原为 ph 元素
-    # ═══════════════════════════════════════════════════════════════════
     _bare_tag_re = re.compile(r"<(/?[a-zA-Z][a-zA-Z0-9]*(?:=[^>]*)?)>")
-    if _bare_tag_re.search(text):
-        # 构建 desc（⟨⟩ 格式）→ tag 的反向索引（仅 fmt 类型）
-        desc_to_tag: dict[str, InlineTag] = {}
-        for tag in tag_map.values():
-            if tag.tag_type in ("fmt", "/fmt", "fmt-open", "fmt-close") and tag.desc:
-                desc_to_tag[tag.desc] = tag
+    if not _bare_tag_re.search(text):
+        return text
 
-        def _replace_bare(m: re.Match) -> str:
-            """将裸标签如 <actor> 替换为 <tag id='N' .../> 或保留原样"""
-            bare = m.group(0)
-            # 尝试匹配：bare "<actor>" → desc "⟨actor⟩"
-            inner = bare[1:-1]  # 去掉 <>
+    # 构建 desc（⟨⟩ 格式）→ tag 的反向索引（仅 fmt 类型）
+    desc_to_tag: dict[str, InlineTag] = {}
+    for tag in tag_map.values():
+        if tag.tag_type in ("fmt", "/fmt", "fmt-open", "fmt-close") and tag.desc:
+            desc_to_tag[tag.desc] = tag
+
+    def _replace_bare(m: re.Match) -> str:
+        """将裸标签如 <actor> 替换为 <tag id='N' .../> 或保留原样"""
+        bare = m.group(0)
+        # 尝试匹配：bare "<actor>" → desc "⟨actor⟩"
+        inner = bare[1:-1]  # 去掉 <>
+        desc_candidate = f"⟨{inner}⟩"
+        if desc_candidate in desc_to_tag:
+            return _tag_to_marker(desc_to_tag[desc_candidate])
+        # 也尝试闭合标签形式 "</actor>" → desc "⟨/actor⟩"
+        if bare.startswith("</"):
+            desc_candidate = f"⟨/{inner[1:] if inner.startswith('/') else inner}⟩"
+        else:
             desc_candidate = f"⟨{inner}⟩"
-            if desc_candidate in desc_to_tag:
-                tag = desc_to_tag[desc_candidate]
-                return _tag_to_marker(tag)
-            # 也尝试闭合标签形式 "</actor>" → desc "⟨/actor⟩"
-            if bare.startswith("</"):
-                desc_candidate = f"⟨/{inner[1:] if inner.startswith('/') else inner}⟩"
-            else:
-                desc_candidate = f"⟨{inner}⟩"
-            if desc_candidate in desc_to_tag:
-                tag = desc_to_tag[desc_candidate]
-                return _tag_to_marker(tag)
-            return m.group(0)  # 无法匹配则保留原样
+        if desc_candidate in desc_to_tag:
+            return _tag_to_marker(desc_to_tag[desc_candidate])
+        return bare  # 无法匹配则保留原样
 
-        text = _bare_tag_re.sub(_replace_bare, text)
+    return _bare_tag_re.sub(_replace_bare, text)
 
-    result_parts = []
+
+def _build_target_mixed_content(target_elem, text: str, tag_map: dict[str, InlineTag]) -> None:
+    """
+    将含 <tag ... /> 标记的译文写入 target 元素（写回用）。
+
+    文本段直接设为 lxml 节点的 text/tail（序列化时自动转义 & < >），
+    标签段解析 source 的原始 ph/bpt/ept 元素后追加。不再把整段译文
+    当作 XML 片段解析，避免译文文本含裸 & 等字符时解析失败，
+    导致标签被降级写成字面文本。
+    """
+    text = _normalize_bare_tags(text, tag_map)
+
     last_end = 0
+    cursor = target_elem  # 当前承载文本的节点（target 或上一个子元素）
+    first_text = True
 
     for m in TAG_RE.finditer(text):
-        # 添加 tag 之前的文本
         if m.start() > last_end:
-            result_parts.append(text[last_end:m.start()])
+            seg = text[last_end:m.start()]
+            if first_text:
+                target_elem.text = seg
+                first_text = False
+            else:
+                cursor.tail = seg
 
         tag_id = m.group(1)
         if tag_id in tag_map:
-            result_parts.append(tag_map[tag_id].original_ph_xml)
+            elem = etree.fromstring(tag_map[tag_id].original_ph_xml)
         else:
             # tag_map 中找不到对应标签，保留原文标记（不应发生）
-            result_parts.append(m.group(0))
-            print(f"  ⚠️ 警告: tag id='{tag_id}' 在 tag_map 中找不到，保留原文", file=sys.stderr)
+            print(f"  ⚠️ 警告: tag id='{tag_id}' 在 tag_map 中找不到，保留原文标记", file=sys.stderr)
+            elem = etree.Element(f"{{{XLIFF_NS}}}tag")
+            elem.set("id", tag_id)
+            elem.set("type", m.group(2))
+            elem.set("desc", html.unescape(m.group(3)))
 
+        target_elem.append(elem)
+        cursor = elem
         last_end = m.end()
 
-    # 添加最后一段文本
     if last_end < len(text):
-        result_parts.append(text[last_end:])
-
-    return "".join(result_parts)
+        seg = text[last_end:]
+        if first_text:
+            target_elem.text = seg
+        else:
+            cursor.tail = seg
 
 
 def _clean_target_text(text: str) -> str:
@@ -542,6 +562,7 @@ def write_translations(
 
     updated_count = 0
     skipped_locked = 0
+    written_ids: list[str] = []
     for tu_elem in root.iter(f"{{{XLIFF_NS}}}trans-unit"):
         tu_id = tu_elem.get("id", "")
         if tu_id not in translations:
@@ -571,12 +592,6 @@ def write_translations(
             # 设置 xml:space="preserve"
             target_elem.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
 
-        # 将 <tag ... /> 替换回原始 XLIFF 元素
-        if tu and tu.source_tag_map:
-            ph_content = _replace_tags_with_ph(target_text, tu.source_tag_map)
-        else:
-            ph_content = target_text
-
         # 保存 tail（target 之后到下一个元素之前的换行/缩进），clear() 会清除它
         target_tail = target_elem.tail
 
@@ -585,15 +600,16 @@ def write_translations(
         target_elem.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
         target_elem.tail = target_tail  # 恢复 tail，保持元素间距
 
-        # 如果有 XLIFF 内联元素（ph/bpt/ept），需要用 lxml 解析再附加
-        if any(tag in ph_content for tag in ("<ph ", "<bpt ", "<ept ")):
-            _set_target_mixed_content(target_elem, ph_content)
+        # 写回：有内联标签时按 tag 切分构建（文本由 lxml 自动转义），无标签则直接设文本
+        if tu and tu.source_tag_map:
+            _build_target_mixed_content(target_elem, target_text, tu.source_tag_map)
         else:
-            target_elem.text = ph_content
+            target_elem.text = target_text
 
         # 更新 mq:status
         tu_elem.set(f"{{{MQ_NS}}}status", new_status)
         updated_count += 1
+        written_ids.append(tu_id)
 
     # 确定输出路径
     if output_path is None:
@@ -624,32 +640,48 @@ def write_translations(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(xml_bytes)
 
+    # 写后校验：重新解析输出文件，确认标签结构与输入一致
+    _validate_written_targets(output_path, trans_units, translations, written_ids)
+
     print(f"✅ 已写入 {updated_count} 条翻译 → {output_path}")
     if skipped_locked:
         print(f"   🔒 跳过 {skipped_locked} 条锁定句段（未覆写）")
     return output_path
 
 
-def _set_target_mixed_content(target_elem, text_with_ph: str):
-    """
-    将混合了文本和 <ph ...>...</ph> 标记的字符串设置到 target 元素中。
-    使用 lxml 解析片段然后附加到 target。
-    """
-    # 用 wrapper 包裹后解析
-    wrapper_xml = f"<wrapper xmlns='{XLIFF_NS}'>{text_with_ph}</wrapper>"
-    try:
-        wrapper = etree.fromstring(wrapper_xml.encode("utf-8"))
-    except etree.XMLSyntaxError as e:
-        print(f"  ⚠️ XML 解析失败: {e}", file=sys.stderr)
-        print(f"  内容: {text_with_ph[:200]}...", file=sys.stderr)
-        target_elem.text = text_with_ph  # fallback: 纯文本
-        return
-
-    # 将 wrapper 的子节点转移到 target
-    if wrapper.text:
-        target_elem.text = wrapper.text
-    for child in wrapper:
-        target_elem.append(child)
+def _validate_written_targets(
+    output_path: Path,
+    trans_units: list[TransUnit],
+    translations: dict[str, str],
+    written_ids: list[str],
+) -> None:
+    """写后校验：重新解析输出文件，逐条核对 target 的标签 id 集合与输入一致，
+    且没有把 <ph>/<bpt>/<ept> 内联标签写成字面文本。失败时非 0 退出（调用方走回滚）。"""
+    parsed_units, _ = parse_mqxliff(output_path)
+    by_id = {tu.id: tu for tu in parsed_units}
+    in_by_id = {tu.id: tu for tu in trans_units}
+    errors: list[str] = []
+    for tu_id in written_ids:
+        tu_in = in_by_id.get(tu_id)
+        tag_map = tu_in.source_tag_map if tu_in else {}
+        expected = [
+            m.group(1)
+            for m in TAG_RE.finditer(_normalize_bare_tags(translations[tu_id], tag_map))
+        ]
+        tu = by_id.get(tu_id)
+        if tu is None:
+            errors.append(f"id={tu_id}: 输出文件中缺失 trans-unit")
+            continue
+        actual = [m.group(1) for m in TAG_RE.finditer(tu.target_text)]
+        if expected != actual:
+            errors.append(f"id={tu_id}: 标签 id 不一致，期望 {expected}，实际 {actual}")
+        if "<ph " in tu.target_text or "<bpt " in tu.target_text or "<ept " in tu.target_text:
+            errors.append(f"id={tu_id}: 内联标签被写成了字面文本")
+    if errors:
+        for msg in errors:
+            print(f"  ❌ {msg}", file=sys.stderr)
+        sys.exit(1)
+    print(f"  ✅ 写后校验通过：{len(written_ids)} 条 target 标签结构一致")
 
 
 # ═══════════════════════════════════════════════════════════════════════

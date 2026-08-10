@@ -18,9 +18,71 @@ TAG_RE = re.compile(r"""<tag\s+id=['"][^'"]+['"].*?/>""")
 SCRIPT_DIR = Path(__file__).resolve().parent.parent  # batch_translate/
 
 
+def _check_batch(
+    expected_ids: list[str],
+    src_by_id: dict[str, str],
+    data,
+    allow_warnings: bool = False,
+) -> tuple[list[str], list[str]]:
+    """纯逻辑校验：返回 (fatal 列表, warnings 列表)，供 CLI 与单测共用。"""
+    fatal: list[str] = []
+    warnings: list[str] = []
+
+    # 容错：自动解包 {"entries": [...]}
+    if isinstance(data, dict) and "entries" in data:
+        warnings.append("wrapped object {entries:[...]}, auto-unwrapped")
+        data = data["entries"]
+
+    if not isinstance(data, list):
+        return ["reviewed JSON 不是数组 → 退回校对步骤重跑"], warnings
+
+    submitted_ids = [str(r.get("id")) for r in data]
+    sub_set = set(submitted_ids)
+    exp_set = set(expected_ids)
+
+    missing = exp_set - sub_set
+    extra = sub_set - exp_set
+
+    # ── 致命：条数不符 / id 未全覆盖 ──
+    if len(data) != len(expected_ids) or missing:
+        fatal.append(f"条数不符：预期 {len(expected_ids)}，实际 {len(data)}")
+        if missing:
+            fatal.append(f"缺失 id（前 20）：{sorted(missing)[:20]}")
+        fatal.append("→ 校对可能只输出了改动条，请要求输出本批全部条目后重跑")
+        return fatal, warnings
+
+    # ── 警告：标签数不一致（占位符/actor 条目豁免） ──
+    tag_bad = []
+    for r in data:
+        rid = str(r["id"])
+        src = src_by_id.get(rid, "")
+        tgt = r.get("target") or ""
+        if "<tag" in src and len(TAG_RE.findall(src)) != len(TAG_RE.findall(tgt)):
+            # 占位符条目：source 含 ⟨actor⟩ 且 target 保留该占位符标签时，
+            # 正文/换行等标签允许按项目规则省略，不做严格数量比对
+            if "⟨actor⟩" in src and "⟨actor⟩" in tgt:
+                continue
+            tag_bad.append(rid)
+
+    # ── 警告：多余 id ──
+    extra_list = sorted(extra) if extra else []
+
+    # ── 汇总 ──
+    if tag_bad:
+        warnings.append(f"{len(tag_bad)} 条标签数与 source 不一致: {tag_bad[:20]}")
+    if extra_list:
+        warnings.append(f"{len(extra_list)} 条 id 不属于本批: {extra_list[:20]}")
+    return fatal, warnings
+
+
 def main():
     parser = argparse.ArgumentParser(description="验证提交前的 reviewed JSON")
     parser.add_argument("--stem", required=True, help="源文件 stem（不含扩展名）")
+    parser.add_argument(
+        "--allow-warnings",
+        action="store_true",
+        help="人工判定剩余警告可接受后放行（原因由调用方记录）",
+    )
     args = parser.parse_args()
     stem = args.stem
 
@@ -55,58 +117,30 @@ def main():
     with open(reviewed_path, encoding="utf-8") as f:
         data = json.load(f)
 
-    # 容错：自动解包 {"entries": [...]}
-    if isinstance(data, dict) and "entries" in data:
-        print("WARNING: wrapped object {entries:[...]}, auto-unwrapped")
-        data = data["entries"]
-
-    if not isinstance(data, list):
-        print("FATAL: reviewed JSON 不是数组 → 退回校对步骤重跑")
+    fatal, warnings = _check_batch(expected_ids, src_by_id, data, args.allow_warnings)
+    if fatal:
+        for f in fatal:
+            print(f"FATAL: {f}")
         sys.exit(1)
-
-    submitted_ids = [str(r.get("id")) for r in data]
-    sub_set = set(submitted_ids)
-    exp_set = set(expected_ids)
-
-    missing = exp_set - sub_set
-    extra = sub_set - exp_set
-
-    # ── 致命：条数不符 / id 未全覆盖 ──
-    if len(data) != len(expected_ids) or missing:
-        print(f"FATAL: 条数不符：预期 {len(expected_ids)}，实际 {len(data)}")
-        if missing:
-            print(f"   缺失 id（前 20）：{sorted(missing)[:20]}")
-        print("   → 校对可能只输出了改动条，请要求输出本批全部条目后重跑")
-        sys.exit(1)
-
-    # ── 警告：标签数不一致 ──
-    tag_bad = []
-    for r in data:
-        rid = str(r["id"])
-        src = src_by_id.get(rid, "")
-        tgt = r.get("target") or ""
-        if "<tag" in src and len(TAG_RE.findall(src)) != len(TAG_RE.findall(tgt)):
-            tag_bad.append(rid)
-
-    # ── 警告：多余 id ──
-    extra_list = sorted(extra) if extra else []
-
-    # ── 汇总 ──
-    warnings = []
-    if tag_bad:
-        warnings.append(f"{len(tag_bad)} 条标签数与 source 不一致: {tag_bad[:20]}")
-    if extra_list:
-        warnings.append(f"{len(extra_list)} 条 id 不属于本批: {extra_list[:20]}")
 
     if warnings:
         print("WARNING:")
         for w in warnings:
             print(f"  - {w}")
-        print(f"RESULT: PASS with warnings ({len(data)} entries, batch {batch_num}/{state['total_batches']})")
+        if args.allow_warnings:
+            print(
+                f"RESULT: PASS (warnings accepted, {len(warnings)} accepted) "
+                f"({len(data)} entries, batch {batch_num}/{state['total_batches']})"
+            )
+        else:
+            print(
+                f"RESULT: PASS with warnings ({len(data)} entries, "
+                f"batch {batch_num}/{state['total_batches']})"
+            )
         sys.exit(0)
-    else:
-        print(f"RESULT: PASS ({len(data)} entries, batch {batch_num}/{state['total_batches']})")
-        sys.exit(0)
+
+    print(f"RESULT: PASS ({len(data)} entries, batch {batch_num}/{state['total_batches']})")
+    sys.exit(0)
 
 
 if __name__ == "__main__":

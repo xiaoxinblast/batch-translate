@@ -245,6 +245,7 @@ def cmd_init(
     source_col: str = "A",
     target_col: str = "B",
     header_row: int = 1,
+    resume: bool = False,
 ):
     """初始化批量翻译：解析源文件 → 中间 JSON，写入 state。"""
     stem = source_path.stem  # 不含扩展名的文件名，用作目录名
@@ -252,6 +253,9 @@ def cmd_init(
 
     state_path = _get_state_path()
     if state_path.is_file():
+        if resume:
+            print("ℹ️ 状态文件已存在，无需重新初始化。直接运行 next 继续。")
+            return
         print("⚠️ 状态文件已存在，将覆盖。")
         print("  如需继续之前的任务，请直接运行 next")
 
@@ -259,7 +263,11 @@ def cmd_init(
     import shutil
     work_dir = _SCRIPT_DIR / "data" / stem
     work_dir.mkdir(parents=True, exist_ok=True)
-    work_file = work_dir / f"_working_{source_path.name}"
+    if resume:
+        # resume 时归一为规范工作文件名，避免从 _working_*.mqxliff 再次加前缀
+        work_file = work_dir / f"_working_{stem}{source_path.suffix.lower()}"
+    else:
+        work_file = work_dir / f"_working_{source_path.name}"
     shutil.copy2(source_path, work_file)
 
     # 用 convert.py 解析
@@ -353,6 +361,9 @@ def cmd_init(
     print(document_summary)
     print()
     print("运行 next 获取第一批翻译任务。")
+    if resume:
+        print("ℹ️ --resume 模式：已有译文将自动锁定；若 exports/<stem>/document_summary.md")
+        print("   已存在，可跳过语境分析直接进入循环。")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -835,6 +846,24 @@ def cmd_export(stem_arg: Optional[str], out_arg: Optional[str], force: bool):
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
+
+    # 导出后校验：重新解析目标文件，确认 XML 合法且全部条目有译文
+    try:
+        sys.path.insert(0, str(_SCRIPT_DIR))
+        from mqxliff_tool import parse_mqxliff
+        units, _ = parse_mqxliff(dst)
+        total = len(units)
+        empty = sum(1 for u in units if not (u.target_text or "").strip())
+        if empty:
+            print(f"❌ 导出校验失败：{dst} 有 {empty}/{total} 条空译文")
+            sys.exit(1)
+        print(f"  ✅ 导出校验通过：{total} 条 trans-unit，全部有译文")
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"❌ 导出校验失败（文件可能损坏）: {e}")
+        sys.exit(1)
+
     print(f"✅ 已导出: {dst}")
 
 
@@ -897,6 +926,11 @@ def main():
     p_init.add_argument("--source-col", type=str, default="A", help="xlsx 源列（默认 A）")
     p_init.add_argument("--target-col", type=str, default="B", help="xlsx 目标列（默认 B）")
     p_init.add_argument("--header-row", type=int, default=1, help="xlsx 表头行号（默认 1）")
+    p_init.add_argument(
+        "--resume",
+        action="store_true",
+        help="从带已有译文的 mqxliff 恢复初始化（状态已存在时不覆盖，直接 next 继续）",
+    )
 
     p_next = sub.add_parser("next", help="输出当前批翻译 JSON（--review 跳过翻译，直接校对）")
     p_next.add_argument("--review", action="store_true", help="跳过翻译，直接生成校对 JSON（用于已有译文的文件）")
@@ -935,6 +969,7 @@ def main():
             source_col=args.source_col,
             target_col=args.target_col,
             header_row=args.header_row,
+            resume=args.resume,
         )
     elif args.command == "next":
         cmd_next(review_only=args.review)
