@@ -64,6 +64,16 @@ class MqxliffWriteTest(unittest.TestCase):
         t2 = next(u for u in units2 if u.id == "2")
         self.assertEqual(t2.target_text, "<tag id='2' type='fmt' desc='⟨actor⟩'/>")
 
+    def test_tag_first_target_keeps_order(self):
+        """译文以 <tag .../> 开头时，写回后文本必须仍位于标签之后。"""
+        tr = {"1": "<tag id='1' type='br' desc='换行'/>メニュー"}
+        out = self.td / "out_tag_first.mqxliff"
+        mt.write_translations(self.tree, self.units, tr, output_path=out)
+
+        units2, _ = mt.parse_mqxliff(out)
+        t1 = next(u for u in units2 if u.id == "1")
+        self.assertEqual(t1.target_text, "<tag id='1' type='br' desc='换行'/>メニュー")
+
     def test_bare_close_tags_normalized(self):
         """裸结束标签 </color>/</i> 按中文 desc 反向还原为 /fmt 标签。"""
         tag_map = {

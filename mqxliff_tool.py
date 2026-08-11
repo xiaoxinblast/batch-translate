@@ -339,7 +339,7 @@ def _build_target_mixed_content(target_elem, text: str, tag_map: dict[str, Inlin
     for m in TAG_RE.finditer(text):
         if m.start() > last_end:
             seg = text[last_end:m.start()]
-            if first_text:
+            if first_text and target_elem.text is None and len(target_elem) == 0:
                 target_elem.text = seg
                 first_text = False
             else:
@@ -362,7 +362,7 @@ def _build_target_mixed_content(target_elem, text: str, tag_map: dict[str, Inlin
 
     if last_end < len(text):
         seg = text[last_end:]
-        if first_text:
+        if first_text and target_elem.text is None and len(target_elem) == 0:
             target_elem.text = seg
         else:
             cursor.tail = seg
