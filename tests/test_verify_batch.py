@@ -125,6 +125,26 @@ class VerifyBatchTest(unittest.TestCase):
                 verify_batch.main()
         self.assertNotEqual(cm.exception.code, 0)
 
+    def test_bare_tag_in_target_is_fatal(self):
+        """target 含非 <tag .../> 形式的裸标签（疑似照抄 TM 参考）→ FATAL。"""
+        entries = [
+            {"id": "1", "source": "あ<tag id='1' type='fmt' desc='⟨color=orange⟩'/>い"},
+        ]
+        self.export_file.write_text(
+            json.dumps({"entries": entries}, ensure_ascii=False), encoding="utf-8"
+        )
+        self.reviewed.write_text(
+            json.dumps([{"id": "1", "target": "あ<color=orange>い</color>"}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self._write_state(1)
+
+        sys.argv = ["verify_batch.py", "--stem", self.STEM, "--allow-warnings"]
+        with self.assertRaises(SystemExit) as cm:
+            with contextlib.redirect_stdout(io.StringIO()):
+                verify_batch.main()
+        self.assertNotEqual(cm.exception.code, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

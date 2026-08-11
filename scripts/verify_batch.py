@@ -15,6 +15,7 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 TAG_RE = re.compile(r"""<tag\s+id=['"][^'"]+['"].*?/>""")
+BARE_TAG_RE = re.compile(r"<(?!tag\b)(/?[a-zA-Z][a-zA-Z0-9]*(?:=[^>]*)?)>")
 SCRIPT_DIR = Path(__file__).resolve().parent.parent  # batch_translate/
 
 
@@ -53,10 +54,14 @@ def _check_batch(
 
     # ── 警告：标签数不一致（占位符/actor 条目豁免） ──
     tag_bad = []
+    bare_bad = []
     for r in data:
         rid = str(r["id"])
         src = src_by_id.get(rid, "")
         tgt = r.get("target") or ""
+        # 致命：target 出现非 <tag .../> 形式的尖括号裸标签（TM 参考照抄特征）
+        if BARE_TAG_RE.search(tgt):
+            bare_bad.append(rid)
         if "<tag" in src and len(TAG_RE.findall(src)) != len(TAG_RE.findall(tgt)):
             # 占位符条目：source 含 ⟨actor⟩ 且 target 保留该占位符标签时，
             # 正文/换行等标签允许按项目规则省略，不做严格数量比对
@@ -68,6 +73,11 @@ def _check_batch(
     extra_list = sorted(extra) if extra else []
 
     # ── 汇总 ──
+    if bare_bad:
+        fatal.append(
+            f"{len(bare_bad)} 条 target 含裸标签（非 <tag .../> 形式，疑似照抄 TM 参考）: "
+            f"{bare_bad[:20]}"
+        )
     if tag_bad:
         warnings.append(f"{len(tag_bad)} 条标签数与 source 不一致: {tag_bad[:20]}")
     if extra_list:

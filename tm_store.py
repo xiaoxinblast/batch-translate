@@ -8,6 +8,42 @@ from pathlib import Path
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+
+# ── 展示层标签归一化（不改数据，只统一 AI 看到的 TM 参考） ─────────
+
+_DISPLAY_TAG_RE = re.compile(
+    r"<tag\s+id=['\"][^'\"]+['\"]\s+type=['\"]([^'\"]*)['\"]\s+desc=['\"]([^'\"]*)['\"]\s*/>"
+)
+_DISPLAY_BARE_RE = re.compile(r"<(?!tag\b)(/?[a-zA-Z][a-zA-Z0-9]*(?:=[^>]*)?)>")
+_CLOSE_NAME_ALIAS = {"斜体": "i", "粗体": "b", "下划线": "u", "颜色": "color", "字号": "size"}
+
+
+def display_tags(text: str) -> str:
+    """把 mqxliff 的 <tag .../> 与 TM 裸标签统一为可读 ⟨...⟩ 形式（仅展示）。
+
+    例：<tag ... desc='⟨actor⟩'/> → ⟨actor⟩；desc='color结束' → ⟨/color⟩；
+    <color=orange> → ⟨color=orange⟩；</i> → ⟨/i⟩；br → 换行符。
+    """
+    def _tag(m):
+        typ, desc = m.group(1), m.group(2)
+        if typ.startswith("/") or desc.endswith("结束"):
+            name = desc[:-2]
+            return f"⟨/{_CLOSE_NAME_ALIAS.get(name, name)}⟩"
+        if desc == "换行":
+            return "\n"
+        return desc if desc.startswith("⟨") and desc.endswith("⟩") else f"⟨{desc}⟩"
+
+    text = _DISPLAY_TAG_RE.sub(_tag, text)
+
+    def _bare(m):
+        inner = m.group(1)
+        closing = inner.startswith("/")
+        core = inner[1:] if closing else inner
+        return f"⟨{'/' if closing else ''}{core}⟩"
+
+    return _DISPLAY_BARE_RE.sub(_bare, text)
+
+
 class TranslationMemory:
     """JSON 翻译记忆库。"""
 

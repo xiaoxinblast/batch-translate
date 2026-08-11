@@ -135,7 +135,7 @@ def _enrich_working_json(json_path: Path, state: dict):
     if tm_path:
         try:
             sys.path.insert(0, str(_SCRIPT_DIR))
-            from tm_store import TranslationMemory
+            from tm_store import TranslationMemory, display_tags
             tm = TranslationMemory(tm_path)
             import re
             tr = re.compile(r"<[^>]+>")
@@ -143,13 +143,20 @@ def _enrich_working_json(json_path: Path, state: dict):
                 plain = tr.sub("", e.get("source", ""))
                 matches = tm.find_matches(plain, query_context=e.get("context", ""))
                 if matches:
-                    e["tm_matches"] = matches
+                    e["tm_matches"] = [
+                        {**m, "source": display_tags(m["source"]), "target": display_tags(m["target"])}
+                        for m in matches
+                    ]
                 # 片段匹配
                 if not matches or all(m["similarity"] < 0.85 for m in matches):
                     exclude = {m["source"] for m in matches} if matches else None
                     frag_matches = tm.find_fragment_matches(plain, exclude_sources=exclude)
                     if frag_matches:
-                        e["tm_fragments"] = frag_matches
+                        e["tm_fragments"] = [
+                            {**f, "match_source": display_tags(f["match_source"]),
+                             "match_target": display_tags(f["match_target"])}
+                            for f in frag_matches
+                        ]
         except ImportError as e:
             print(f"⚠️ tm_store 导入失败，跳过 TM 增强: {e}")
         except Exception as e:

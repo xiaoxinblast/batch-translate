@@ -37,9 +37,10 @@ try:
 except ImportError:
     TermBase = None  # type: ignore[assignment]
 try:
-    from tm_store import TranslationMemory
+    from tm_store import TranslationMemory, display_tags
 except ImportError:
     TranslationMemory = None  # type: ignore[assignment]
+    display_tags = None  # type: ignore[assignment]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -280,9 +281,22 @@ def _normalize_bare_tags(text: str, tag_map: dict[str, InlineTag]) -> str:
 
     # 构建 desc（⟨⟩ 格式）→ tag 的反向索引（仅 fmt 类型）
     desc_to_tag: dict[str, InlineTag] = {}
+    close_to_tag: dict[str, InlineTag] = {}
+    _close_aliases = {
+        "color": "color", "颜色": "color",
+        "i": "斜体", "斜体": "斜体",
+        "b": "粗体", "粗体": "粗体",
+        "u": "下划线", "下划线": "下划线",
+        "size": "字号", "字号": "字号",
+    }
     for tag in tag_map.values():
         if tag.tag_type in ("fmt", "/fmt", "fmt-open", "fmt-close") and tag.desc:
             desc_to_tag[tag.desc] = tag
+        if tag.tag_type in ("/fmt", "fmt-close") and tag.desc.endswith("结束"):
+            zh_name = tag.desc[:-2]
+            for alias, zh in _close_aliases.items():
+                if zh == zh_name:
+                    close_to_tag[alias] = tag
 
     def _replace_bare(m: re.Match) -> str:
         """将裸标签如 <actor> 替换为 <tag id='N' .../> 或保留原样"""
@@ -294,6 +308,9 @@ def _normalize_bare_tags(text: str, tag_map: dict[str, InlineTag]) -> str:
             return _tag_to_marker(desc_to_tag[desc_candidate])
         # 也尝试闭合标签形式 "</actor>" → desc "⟨/actor⟩"
         if bare.startswith("</"):
+            core = inner[1:] if inner.startswith("/") else inner
+            if core in close_to_tag:
+                return _tag_to_marker(close_to_tag[core])
             desc_candidate = f"⟨/{inner[1:] if inner.startswith('/') else inner}⟩"
         else:
             desc_candidate = f"⟨{inner}⟩"
@@ -757,14 +774,21 @@ def export_to_json(
         if tm and tu.source_text:
             matches = tm.find_matches(tu.source_text, threshold=tm_threshold)
             if matches:
-                record["tm_matches"] = matches
+                record["tm_matches"] = [
+                    {**m, "source": display_tags(m["source"]), "target": display_tags(m["target"])}
+                    for m in matches
+                ]
                 tm_total += 1
             # 片段匹配：仅当整句匹配为空或最高分 < 0.85 时才启用
             if not matches or all(m["similarity"] < 0.85 for m in matches):
                 exclude = {m["source"] for m in matches} if matches else None
                 frag_matches = tm.find_fragment_matches(tu.source_text, exclude_sources=exclude)
                 if frag_matches:
-                    record["tm_fragments"] = frag_matches
+                    record["tm_fragments"] = [
+                        {**f, "match_source": display_tags(f["match_source"]),
+                         "match_target": display_tags(f["match_target"])}
+                        for f in frag_matches
+                    ]
 
         records.append(record)
 

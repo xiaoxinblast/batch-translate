@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from tm_store import TranslationMemory
+from tm_store import TranslationMemory, display_tags
 
 
 def _write_tm(path: Path, entries: list[dict]) -> Path:
@@ -153,6 +153,30 @@ class TmIndexTest(unittest.TestCase):
         first = json.loads(outputs[0])
         self.assertEqual([m["source"] for m in first],
                          ["装備とマテリア", "マテリア", "魔法マテリア"])
+
+    def test_display_tags_unifies_mqxliff_and_bare_formats(self):
+        """展示层把 mqxliff <tag .../> 与 TM 裸标签统一为 ⟨...⟩ 形式。"""
+        mq = (
+            "<tag id='1' type='fmt' desc='⟨actor⟩'/>"
+            "<tag id='2' type='fmt' desc='⟨color=orange⟩'/>本文"
+            "<tag id='3' type='/fmt' desc='color结束'/>"
+            "<tag id='4' type='br' desc='换行'/>"
+            "<tag id='5' type='/fmt' desc='斜体结束'/>"
+        )
+        past = "<actor><color=orange>本文</color>\n<i>斜</i>"
+        self.assertEqual(
+            display_tags(mq),
+            "⟨actor⟩⟨color=orange⟩本文⟨/color⟩\n⟨/i⟩",
+        )
+        self.assertEqual(
+            display_tags(past),
+            "⟨actor⟩⟨color=orange⟩本文⟨/color⟩\n⟨i⟩斜⟨/i⟩",
+        )
+
+    def test_display_tags_leaves_plain_text_untouched(self):
+        """普通文本与 & 不受展示转换影响。"""
+        self.assertEqual(display_tags("MATERIA&EQUIPMENT"), "MATERIA&EQUIPMENT")
+        self.assertEqual(display_tags("装備とマテリア"), "装備とマテリア")
 
 
 if __name__ == "__main__":

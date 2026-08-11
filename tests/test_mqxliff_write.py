@@ -64,6 +64,37 @@ class MqxliffWriteTest(unittest.TestCase):
         t2 = next(u for u in units2 if u.id == "2")
         self.assertEqual(t2.target_text, "<tag id='2' type='fmt' desc='⟨actor⟩'/>")
 
+    def test_bare_close_tags_normalized(self):
+        """裸结束标签 </color>/</i> 按中文 desc 反向还原为 /fmt 标签。"""
+        tag_map = {
+            "1": mt.InlineTag(
+                ph_id="1", tag_type="fmt", desc="⟨color=orange⟩",
+                original_ph_xml="<ph id='1'>&lt;mq:rxt displaytext=&quot;&amp;lt;color=orange&amp;gt;&quot; /&gt;</ph>",
+            ),
+            "2": mt.InlineTag(
+                ph_id="2", tag_type="/fmt", desc="color结束",
+                original_ph_xml="<ph id='2'>&lt;mq:rxt displaytext=&quot;&amp;lt;/color&amp;gt;&quot; /&gt;</ph>",
+            ),
+            "3": mt.InlineTag(
+                ph_id="3", tag_type="fmt", desc="⟨actor⟩",
+                original_ph_xml="<ph id='3'>&lt;mq:rxt displaytext=&quot;&amp;lt;actor&amp;gt;&quot; /&gt;</ph>",
+            ),
+            "4": mt.InlineTag(
+                ph_id="4", tag_type="/fmt", desc="斜体结束",
+                original_ph_xml="<ph id='4'>&lt;mq:rxt displaytext=&quot;&amp;lt;/i&amp;gt;&quot; /&gt;</ph>",
+            ),
+        }
+        out = mt._normalize_bare_tags(
+            "本文<color=orange>強調</color>と<i>斜体</i><actor>", tag_map
+        )
+        self.assertIn("<tag id='1' type='fmt' desc='⟨color=orange⟩'/>", out)
+        self.assertIn("<tag id='2' type='/fmt' desc='color结束'/>", out)
+        self.assertIn("<tag id='4' type='/fmt' desc='斜体结束'/>", out)
+        self.assertIn("<tag id='3' type='fmt' desc='⟨actor⟩'/>", out)
+        self.assertNotIn("<color", out)
+        self.assertNotIn("</color>", out)
+        self.assertNotIn("</i>", out)
+
     def test_validation_catches_tag_id_mismatch(self):
         """输入期望的标签 id 与输出不一致时，写后校验必须非 0 退出。"""
         tr = {"1": "在主菜单“MATERIA&EQUIPMENT”按"}
