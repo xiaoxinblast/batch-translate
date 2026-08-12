@@ -15,6 +15,7 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 TAG_RE = re.compile(r"""<tag\s+id=['"][^'"]+['"].*?/>""")
+BR_RE = re.compile(r"""<tag\s+id=['"][^'"]+['"]\s+type=['"]br['"].*?/>""")
 BARE_TAG_RE = re.compile(r"<(?!tag\b)(/?[a-zA-Z][a-zA-Z0-9]*(?:=[^>]*)?)>")
 SCRIPT_DIR = Path(__file__).resolve().parent.parent  # batch_translate/
 
@@ -62,7 +63,11 @@ def _check_batch(
         # 致命：target 出现非 <tag .../> 形式的尖括号裸标签（TM 参考照抄特征）
         if BARE_TAG_RE.search(tgt):
             bare_bad.append(rid)
-        if "<tag" in src and len(TAG_RE.findall(src)) != len(TAG_RE.findall(tgt)):
+        # br 换行标签允许按中文可读性省略/合并（原译文短时不强制与 source 一致），
+        # 只比对非 br 的内联标签数量
+        n_src = len(TAG_RE.findall(src)) - len(BR_RE.findall(src))
+        n_tgt = len(TAG_RE.findall(tgt)) - len(BR_RE.findall(tgt))
+        if "<tag" in src and n_src != n_tgt:
             # 占位符条目：source 含 ⟨actor⟩ 且 target 保留该占位符标签时，
             # 正文/换行等标签允许按项目规则省略，不做严格数量比对
             if "⟨actor⟩" in src and "⟨actor⟩" in tgt:

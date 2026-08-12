@@ -91,6 +91,7 @@ class TransUnit:
     source_tag_map: dict[str, InlineTag]  # tag_id → InlineTag 映射（含 ph/bpt/ept）
     target_text: str           # 含 <tag ... /> 标记的译文（初始为空）
     has_inline_tags: bool = False
+    maxlengthchars: str = ""    # mq:maxlengthchars（断行/长度硬限制）
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -406,6 +407,7 @@ def _parse_trans_unit(tu_elem) -> TransUnit:
     )
     segment_guid = tu_elem.get(f"{{{MQ_NS}}}segmentguid", "")
     first_label = tu_elem.get(f"{{{MQ_NS}}}firstlabel", "")
+    maxlengthchars = tu_elem.get(f"{{{MQ_NS}}}maxlengthchars", "")
 
     # source + 内联标签
     source_elem = tu_elem.find(f"{{{XLIFF_NS}}}source")
@@ -443,6 +445,7 @@ def _parse_trans_unit(tu_elem) -> TransUnit:
         source_tag_map=tag_map,
         target_text=target_text,
         has_inline_tags=has_tags,
+        maxlengthchars=maxlengthchars,
     )
 
 
@@ -759,6 +762,8 @@ def export_to_json(
             "source": tu.source_text,
             "target": tu.target_text,
         }
+        if tu.maxlengthchars:
+            record["maxlengthchars"] = tu.maxlengthchars
         if tu.has_inline_tags:
             record["has_tags"] = True
 

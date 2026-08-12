@@ -64,7 +64,7 @@ class VerifyBatchTest(unittest.TestCase):
                 "source": (
                     "（う……）<tag id='1' type='br' desc='换行'/>"
                     "<tag id='2' type='fmt' desc='⟨actor⟩'/>"
-                    "<tag id='3' type='br' desc='换行'/>クラウド"
+                    "<tag id='3' type='fmt' desc='⟨color=orange⟩'/>"
                 ),
             },
             {
@@ -88,13 +88,13 @@ class VerifyBatchTest(unittest.TestCase):
         self._write_state(2)
 
         out = self._run()
-        self.assertIn("1 条标签数与 source 不一致", out)
-        self.assertNotIn("['1']", out)
+        self.assertNotIn("标签数与 source 不一致", out)
+        self.assertIn("RESULT: PASS", out)
 
     def test_allow_warnings_flag(self):
         """--allow-warnings 时输出 warnings accepted。"""
         entries = [
-            {"id": "1", "source": "あ<tag id='1' type='br' desc='换行'/>い"},
+            {"id": "1", "source": "あ<tag id='1' type='fmt' desc='⟨color=orange⟩'/>い"},
         ]
         self.export_file.write_text(
             json.dumps({"entries": entries}, ensure_ascii=False), encoding="utf-8"

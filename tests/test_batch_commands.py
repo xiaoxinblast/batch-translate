@@ -1,6 +1,7 @@
 """batch.py 新增命令（summary/export/term-gaps）的回归测试。"""
 
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -47,6 +48,14 @@ class BatchCommandsTest(unittest.TestCase):
         )
         mq = bt / "data" / cls.STEM / f"_working_{cls.STEM}.mqxliff"
         mq.write_text(_MINI_MQ, encoding="utf-8")
+        # cmd_export 以最新 _working.json 经 mqxliff_tool import 重新写回
+        shutil.copy2(ROOT / "mqxliff_tool.py", bt / "mqxliff_tool.py")
+        (bt / "exports" / cls.STEM / "_working.json").write_text(
+            json.dumps({
+                "entries": [{"id": "1", "source": "こんにちは", "target": "你好"}],
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
         batch._SCRIPT_DIR = bt
         batch._ACTIVE_PROJECT = bt / "data" / ".active_project"
 
@@ -101,7 +110,7 @@ class BatchCommandsTest(unittest.TestCase):
             dst.unlink()
         batch.cmd_export(None, None, False)
         self.assertTrue(dst.is_file())
-        self.assertEqual(dst.read_text(encoding="utf-8"), _MINI_MQ)
+        self.assertIn("你好", dst.read_text(encoding="utf-8"))
 
     def test_export_refuses_overwrite_without_force(self):
         dst = Path(self._tmp.name) / "已交付" / f"{self.STEM}.mqxliff"
@@ -110,7 +119,7 @@ class BatchCommandsTest(unittest.TestCase):
             batch.cmd_export(None, None, False)
         self.assertEqual(dst.read_text(encoding="utf-8"), "OLD")
         batch.cmd_export(None, None, True)
-        self.assertEqual(dst.read_text(encoding="utf-8"), _MINI_MQ)
+        self.assertIn("你好", dst.read_text(encoding="utf-8"))
 
     def test_export_custom_out(self):
         out = Path(self._tmp.name) / "_temp" / "custom.mqxliff"

@@ -29,14 +29,14 @@ class ReviewLockedTest(unittest.TestCase):
         self.assertTrue(review["entries"][0]["locked"])
         self.assertFalse(review["entries"][1]["locked"])
 
-    def test_review_only_locks_existing_targets(self):
-        """next --review 模式下，已有译文的条目自动视为 locked。"""
+    def test_review_only_does_not_lock_existing_targets(self):
+        """next --review 模式下，已有译文是待校对对象，不标记为锁定。"""
         entries = [
             {"id": "1", "source": "A", "target": "已有译文"},
             {"id": "2", "source": "B", "target": ""},
         ]
         review = batch._build_review_json(entries, _state(), batch_num=1, review_only=True)
-        self.assertTrue(review["entries"][0]["locked"])
+        self.assertFalse(review["entries"][0]["locked"])
         self.assertFalse(review["entries"][1]["locked"])
 
 

@@ -120,11 +120,20 @@ def _enrich_working_json(json_path: Path, state: dict):
             tb.load()
             import re
             tr = re.compile(r"<[^>]+>")
-            for e in data.get("entries", []):
-                plain = tr.sub("", e.get("source", ""))
-                terms = tb.find_terms(plain)
-                if terms:
-                    e["terms"] = terms
+            entries = data.get("entries", [])
+            term_failures = 0
+            for e in entries:
+                try:
+                    plain = tr.sub("", e.get("source", ""))
+                    terms = tb.find_terms(plain)
+                    if terms:
+                        e["terms"] = terms
+                except Exception as exc:
+                    term_failures += 1
+                    if term_failures <= 3:
+                        print(f"  ⚠️ 术语匹配失败 id={e.get('id')}: {exc}")
+            if term_failures:
+                print(f"⚠️ 术语增强完成，{term_failures}/{len(entries)} 条失败（已跳过）")
         except ImportError as e:
             print(f"⚠️ term_base 导入失败，跳过术语增强: {e}")
         except Exception as e:
@@ -139,24 +148,33 @@ def _enrich_working_json(json_path: Path, state: dict):
             tm = TranslationMemory(tm_path)
             import re
             tr = re.compile(r"<[^>]+>")
-            for e in data.get("entries", []):
-                plain = tr.sub("", e.get("source", ""))
-                matches = tm.find_matches(plain, query_context=e.get("context", ""))
-                if matches:
-                    e["tm_matches"] = [
-                        {**m, "source": display_tags(m["source"]), "target": display_tags(m["target"])}
-                        for m in matches
-                    ]
-                # 片段匹配
-                if not matches or all(m["similarity"] < 0.85 for m in matches):
-                    exclude = {m["source"] for m in matches} if matches else None
-                    frag_matches = tm.find_fragment_matches(plain, exclude_sources=exclude)
-                    if frag_matches:
-                        e["tm_fragments"] = [
-                            {**f, "match_source": display_tags(f["match_source"]),
-                             "match_target": display_tags(f["match_target"])}
-                            for f in frag_matches
+            entries = data.get("entries", [])
+            tm_failures = 0
+            for e in entries:
+                try:
+                    plain = tr.sub("", e.get("source", ""))
+                    matches = tm.find_matches(plain, query_context=e.get("context", ""))
+                    if matches:
+                        e["tm_matches"] = [
+                            {**m, "source": display_tags(m["source"]), "target": display_tags(m["target"])}
+                            for m in matches
                         ]
+                    # 片段匹配
+                    if not matches or all(m["similarity"] < 0.85 for m in matches):
+                        exclude = {m["source"] for m in matches} if matches else None
+                        frag_matches = tm.find_fragment_matches(plain, exclude_sources=exclude)
+                        if frag_matches:
+                            e["tm_fragments"] = [
+                                {**f, "match_source": display_tags(f["match_source"]),
+                                 "match_target": display_tags(f["match_target"])}
+                                for f in frag_matches
+                            ]
+                except Exception as exc:
+                    tm_failures += 1
+                    if tm_failures <= 3:
+                        print(f"  ⚠️ TM 匹配失败 id={e.get('id')}: {exc}")
+            if tm_failures:
+                print(f"⚠️ TM 增强完成，{tm_failures}/{len(entries)} 条失败（已跳过）")
         except ImportError as e:
             print(f"⚠️ tm_store 导入失败，跳过 TM 增强: {e}")
         except Exception as e:
@@ -219,7 +237,10 @@ def _build_review_json(
             "source": e["source"],
             "translated": translated,
         }
-        if "locked" in e:
+        if review_only:
+            # review 模式：已有译文是待校对对象，不标记为锁定
+            item["locked"] = False
+        elif "locked" in e:
             item["locked"] = bool(e["locked"])
         else:
             item["locked"] = bool(str(translated).strip())
@@ -227,6 +248,8 @@ def _build_review_json(
             item["context"] = e["context"]
         if e.get("note"):
             item["note"] = e["note"]
+        if e.get("maxlengthchars"):
+            item["maxlengthchars"] = e["maxlengthchars"]
         if e.get("terms"):
             item["terms"] = e["terms"]
         if e.get("tm_matches"):
@@ -679,17 +702,22 @@ def cmd_submit(result_path: Path):
             if tm_path:
                 _accumulate_tm(export_file, tm_path)
 
-        # 重新 parse（TM 已更新，获取最新 matches）
-        reexport_file = _SCRIPT_DIR / "exports" / state["stem"] / "_working.json"
-        parse_args = [
-            sys.executable, str(_SCRIPT_DIR / "convert.py"), "parse",
-            str(work_file),
-            "--output", str(reexport_file),
-        ]
-        subprocess.run(parse_args, check=True)
+        # review 全译文模式：target 已由校对确认，跳过重新 parse 与术语/TM 增强
+        # （避免每批提交都全量重算 36k 术语 × 全部条目的匹配，造成数分钟等待）
+        if state.get("existing_targets") == state["total"]:
+            print("ℹ️ review 模式：跳过重新解析与术语/TM 增强")
+        else:
+            # 重新 parse（TM 已更新，获取最新 matches）
+            reexport_file = _SCRIPT_DIR / "exports" / state["stem"] / "_working.json"
+            parse_args = [
+                sys.executable, str(_SCRIPT_DIR / "convert.py"), "parse",
+                str(work_file),
+                "--output", str(reexport_file),
+            ]
+            subprocess.run(parse_args, check=True)
 
-        # 对工作 JSON 做术语/TM/风格指南增强
-        _enrich_working_json(reexport_file, state)
+            # 对工作 JSON 做术语/TM/风格指南增强
+            _enrich_working_json(reexport_file, state)
 
     except Exception:
         # 回滚：恢复 _working.json，状态不变
@@ -709,9 +737,9 @@ def cmd_submit(result_path: Path):
         state_path.unlink(missing_ok=True)
         return
 
-    # 自动输出下一批
+    # 自动输出下一批（review 全译文模式继续走校对）
     print()
-    cmd_next()
+    cmd_next(review_only=(state.get("existing_targets") == state["total"]))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -835,12 +863,78 @@ def cmd_summary(report_file: Path, stem_arg: Optional[str]):
     print(f"📄 sidecar 已写入: {sidecar}")
 
 
+def cmd_refresh(
+    stem_arg: Optional[str],
+    tm_arg: Optional[str] = None,
+    terms_arg: Optional[str] = None,
+    style_guide_arg: Optional[str] = None,
+):
+    """重新解析工作文件并重跑术语/TM/风格指南增强。
+
+    适用于 init 时增强中断/不完整，或 TM/术语库更新后刷新参考。
+    有 state 时复用 state 记录的路径；state 已清理（全部提交完成）时
+    默认使用 batch_translate/data/ 下的编译产物，可用 --tm/--terms/--style-guide 覆盖。
+    注意：以工作 mqxliff 为事实源重新 parse，若手工只改过 _working.json
+    而未写回 mqxliff，这些改动不会保留。
+    """
+    import subprocess
+    stem = _resolve_stem(stem_arg)
+    state_path = _SCRIPT_DIR / "data" / stem / "batch_state.json"
+    if state_path.is_file():
+        with open(state_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        work_file = Path(state["source_file"])
+        enrich_state = {
+            "terms_path": state.get("terms_path"),
+            "tm_path": state.get("tm_path"),
+            "style_guide_path": state.get("style_guide_path"),
+        }
+    else:
+        work_file = _SCRIPT_DIR / "data" / stem / f"_working_{stem}.mqxliff"
+        enrich_state = {
+            "terms_path": str(Path(terms_arg).resolve()) if terms_arg
+                         else str(_SCRIPT_DIR / "data" / "term_base.xlsx"),
+            "tm_path": str(Path(tm_arg).resolve()) if tm_arg
+                       else str(_SCRIPT_DIR / "data" / "tm_memory.json"),
+            "style_guide_path": str(Path(style_guide_arg).resolve()) if style_guide_arg
+                                else str(_SCRIPT_DIR / "data" / "style_guide.txt"),
+        }
+
+    if not work_file.is_file():
+        print(f"❌ 工作文件不存在: {work_file}")
+        sys.exit(1)
+    for key, label in (("terms_path", "术语库"), ("tm_path", "TM"),
+                       ("style_guide_path", "风格指南")):
+        p = enrich_state.get(key)
+        if p and not Path(p).is_file():
+            print(f"⚠️ {label}不存在: {p}（该部分将跳过）")
+
+    export_file = _SCRIPT_DIR / "exports" / stem / "_working.json"
+    export_file.parent.mkdir(parents=True, exist_ok=True)
+    parse_args = [
+        sys.executable, str(_SCRIPT_DIR / "convert.py"), "parse",
+        str(work_file), "--output", str(export_file),
+    ]
+    if work_file.suffix.lower() == ".mqxliff":
+        parse_args += ["--output-dir", str(export_file.parent)]
+    subprocess.run(parse_args, check=True)
+
+    _enrich_working_json(export_file, enrich_state)
+    with open(export_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    print(f"✅ refresh 完成：{len(data.get('entries', []))} 条已重新注入术语/TM/风格指南 → {export_file}")
+
+
 def cmd_export(stem_arg: Optional[str], out_arg: Optional[str], force: bool):
     """导出最终译文 mqxliff（默认复制到项目 已交付/ 目录）。"""
     stem = _resolve_stem(stem_arg)
-    src = _SCRIPT_DIR / "data" / stem / f"_working_{stem}.mqxliff"
-    if not src.is_file():
-        print(f"❌ 工作 mqxliff 不存在: {src}")
+    export_file = _SCRIPT_DIR / "exports" / stem / "_working.json"
+    if not export_file.is_file():
+        print(f"❌ 工作 JSON 不存在: {export_file}")
+        sys.exit(1)
+    work_file = _SCRIPT_DIR / "data" / stem / f"_working_{stem}.mqxliff"
+    if not work_file.is_file():
+        print(f"❌ 工作 mqxliff 不存在: {work_file}")
         sys.exit(1)
 
     if out_arg:
@@ -852,7 +946,12 @@ def cmd_export(stem_arg: Optional[str], out_arg: Optional[str], force: bool):
         sys.exit(1)
 
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
+    # 始终以最新 _working.json 为事实源重新写回，避免直接修改 JSON 后导出旧数据
+    import subprocess
+    subprocess.run([
+        sys.executable, str(_SCRIPT_DIR / "mqxliff_tool.py"), "import",
+        str(export_file), str(work_file), "--output", str(dst),
+    ], check=True)
 
     # 导出后校验：重新解析目标文件，确认 XML 合法且全部条目有译文
     try:
@@ -951,6 +1050,15 @@ def main():
     p_summary.add_argument("report", type=str, help="报告文件路径（UTF-8 文本）")
     p_summary.add_argument("--stem", type=str, default=None,
                            help="项目 stem（默认 data/.active_project）")
+    p_refresh = sub.add_parser("refresh", help="重新解析工作文件并重跑术语/TM/风格指南增强")
+    p_refresh.add_argument("--stem", type=str, default=None,
+                           help="项目 stem（默认 data/.active_project）")
+    p_refresh.add_argument("--tm", type=str, default=None,
+                           help="TM JSON 路径（state 不存在时默认 data/tm_memory.json）")
+    p_refresh.add_argument("--terms", type=str, default=None,
+                           help="术语库 xlsx 路径（state 不存在时默认 data/term_base.xlsx）")
+    p_refresh.add_argument("--style-guide", type=str, default=None,
+                           help="风格指南 txt 路径（state 不存在时默认 data/style_guide.txt）")
     p_export = sub.add_parser("export", help="导出最终译文 mqxliff")
     p_export.add_argument("--stem", type=str, default=None,
                           help="项目 stem（默认 data/.active_project）")
@@ -990,6 +1098,8 @@ def main():
         cmd_retry()
     elif args.command == "summary":
         cmd_summary(Path(args.report), args.stem)
+    elif args.command == "refresh":
+        cmd_refresh(args.stem, args.tm, args.terms, args.style_guide)
     elif args.command == "export":
         cmd_export(args.stem, args.out, args.force)
     elif args.command == "term-gaps":
