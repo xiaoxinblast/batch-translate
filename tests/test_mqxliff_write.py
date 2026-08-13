@@ -154,7 +154,7 @@ class MqxliffWriteTest(unittest.TestCase):
         tm_file = self.td / "tm.json"
         tm_file.write_text(json.dumps({"entries": [
             {"source": "ＭＲ２５０になった", "target": "迈入大师等级250",
-             "context": "c1", "file": "旧文件"},
+             "context": "c1", "file": "simple.mqxliff"},
         ]}, ensure_ascii=False), encoding="utf-8")
         json_file = self.td / "translations.json"
         json_file.write_text(json.dumps({

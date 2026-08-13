@@ -74,8 +74,9 @@ class TranslationMemory:
     def add(self, entries: list[dict], dedup: bool = True, replace: bool = False):
         """追加条目；dedup=True 按 (source, context) 去重。
 
-        replace=True 时同键旧条目被新译文覆盖（用于提交后积累最新确认译文）；
-        否则同键旧条目优先保留（用于批量建库，保持来源优先级）。
+        replace=True 时仅覆盖同键且同 file 来源的旧条目（用于提交后积累
+        同一工作文件的确认译文）；同键但来源不同（如 Master 权威条目）不覆盖，
+        避免工作译文顶掉更高优先级来源。
         """
         self.load()
         added: list[dict] = []
@@ -86,6 +87,7 @@ class TranslationMemory:
                     (e.get("source", "").strip(), e.get("context", "").strip()), i
                 )
             replaced = 0
+            skipped_other_source = 0
             for e in entries:
                 k = (e.get("source", "").strip(), e.get("context", "").strip())
                 entry = {
@@ -100,10 +102,16 @@ class TranslationMemory:
                     existing[k] = len(self._entries) - 1
                     added.append(entry)
                 elif replace:
-                    self._entries[idx] = entry
-                    replaced += 1
+                    old = self._entries[idx]
+                    if (old.get("file", "") or "") == (entry.get("file", "") or ""):
+                        self._entries[idx] = entry
+                        replaced += 1
+                    else:
+                        skipped_other_source += 1
             if replaced:
                 print(f"ℹ️ TM 更新 {replaced} 条同键旧译文（replace=True）")
+            if skipped_other_source:
+                print(f"ℹ️ TM 跳过 {skipped_other_source} 条同键不同来源条目（保留原来源，避免覆盖权威）")
         else:
             self._entries.extend(entries)
             added = list(entries)

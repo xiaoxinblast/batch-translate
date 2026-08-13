@@ -135,18 +135,28 @@ class TmIndexTest(unittest.TestCase):
         self.assertEqual(tm._entries[0]["target"], "迈入大师等级250")
         self.assertEqual(len(tm._norm_lens), len(tm._entries))
 
-    def test_add_replace_true_updates_same_key(self):
-        """提交积累使用 replace=True：同键新译文覆盖旧译文，条目数不变且索引可查。"""
+    def test_add_replace_true_updates_same_source(self):
+        """提交积累使用 replace=True：同键且同 file 来源时新译文覆盖旧译文。"""
         tm = self._tm([{"source": "ＭＲ２５０になった", "target": "迈入大师等级250",
-                        "context": "c1", "file": "旧文件"}])
+                        "context": "c1", "file": "_working_分割_zho-CN.mqxliff"}])
         tm.add([{"source": "ＭＲ２５０になった", "target": "大师等级达到250级",
-                 "context": "c1", "file": "新文件"}], replace=True)
+                 "context": "c1", "file": "_working_分割_zho-CN.mqxliff"}], replace=True)
         self.assertEqual(len(tm._entries), 1)
         self.assertEqual(tm._entries[0]["target"], "大师等级达到250级")
-        self.assertEqual(tm._entries[0]["file"], "新文件")
         self.assertEqual(len(tm._norm_lens), len(tm._entries))
         got = tm.find_matches("ＭＲ２５０になった", threshold=1.0)
         self.assertEqual(got[0]["target"], "大师等级达到250级")
+
+    def test_add_replace_true_keeps_other_source(self):
+        """replace=True 不覆盖同键但来源不同的条目（保留 Master 等权威）。"""
+        tm = self._tm([{"source": "オンライン設定", "target": "在线设定",
+                        "context": "RefMenu_277_MR", "file": "EXP Master 2026-07-21"}])
+        tm.add([{"source": "オンライン設定", "target": "在线设置",
+                 "context": "RefMenu_277_MR", "file": "_working_分割_zho-CN.mqxliff"}],
+               replace=True)
+        self.assertEqual(len(tm._entries), 1)
+        self.assertEqual(tm._entries[0]["target"], "在线设定")
+        self.assertEqual(tm._entries[0]["file"], "EXP Master 2026-07-21")
 
     def test_result_deterministic_across_hash_seeds(self):
         """跨进程 PYTHONHASHSEED 不同时，截断边界不因 set 哈希随机化漂移。"""
