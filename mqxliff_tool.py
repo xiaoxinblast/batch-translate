@@ -886,9 +886,12 @@ def import_from_json(
     # 追加到翻译记忆
     if tm_path and TranslationMemory is not None:
         tm = TranslationMemory(tm_path)
-        tm.add(tm_new_entries)
+        before = len(tm)
+        # replace：提交后的译文是已确认版本，同键旧译文必须被覆盖，
+        # 否则 TM 会一直停留在 init 前导入的旧译文
+        tm.add(tm_new_entries, replace=True)
         tm.save()
-        print(f"🧠 翻译记忆已更新: +{len(tm_new_entries)} 条 → {tm_path}")
+        print(f"🧠 翻译记忆已更新: +{len(tm) - before} 条（提交 {len(tm_new_entries)} 条）→ {tm_path}")
 
     return result_path
 

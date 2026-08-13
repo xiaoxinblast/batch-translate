@@ -93,7 +93,8 @@ def _accumulate_tm(export_file: Path, tm_path: str):
                 "file": data.get("source_file", ""),
             })
     if entries:
-        tm.add(entries)
+        # 提交后的译文是已确认版本，同键旧译文必须被覆盖
+        tm.add(entries, replace=True)
         tm.save()
 
 

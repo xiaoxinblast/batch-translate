@@ -1,5 +1,6 @@
 """mqxliff 写回（含裸 & 转义）回归测试。"""
 
+import json
 import sys
 import tempfile
 import unittest
@@ -135,6 +136,42 @@ class MqxliffWriteTest(unittest.TestCase):
             mt._validate_written_targets(
                 bad, units_bad, {"1": "在主菜单“MATERIA&EQUIPMENT”"}, ["1"]
             )
+
+    def test_import_save_tm_replaces_stale_same_key(self):
+        """import --save-tm 用 replace 语义：同键旧译文被提交后的新译文覆盖。"""
+        simple = self.td / "simple.mqxliff"
+        simple.write_text("""<?xml version='1.0' encoding='UTF-8'?>
+<xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:mq="MQXliff" version="1.2">
+<file original="t" source-language="ja" target-language="zh-cn" datatype="x-memoq">
+<body>
+<trans-unit id="1" mq:status="NotStarted" mq:locked="no">
+<source xml:space="preserve">ＭＲ２５０になった</source>
+<target xml:space="preserve"></target>
+</trans-unit>
+</body>
+</file>
+</xliff>""", encoding="utf-8")
+        tm_file = self.td / "tm.json"
+        tm_file.write_text(json.dumps({"entries": [
+            {"source": "ＭＲ２５０になった", "target": "迈入大师等级250",
+             "context": "c1", "file": "旧文件"},
+        ]}, ensure_ascii=False), encoding="utf-8")
+        json_file = self.td / "translations.json"
+        json_file.write_text(json.dumps({
+            "source_file": "simple.mqxliff",
+            "entries": [
+                {"id": "1", "source": "ＭＲ２５０になった",
+                 "target": "大师等级达到250级", "context": "c1"},
+            ],
+        }, ensure_ascii=False), encoding="utf-8")
+        out = self.td / "out_save_tm.mqxliff"
+
+        mt.import_from_json(json_file, simple, output_path=out, tm_path=tm_file)
+
+        tm_data = json.loads(tm_file.read_text(encoding="utf-8"))
+        self.assertEqual(len(tm_data["entries"]), 1)
+        self.assertEqual(tm_data["entries"][0]["target"], "大师等级达到250级")
+        self.assertEqual(tm_data["entries"][0]["file"], "simple.mqxliff")
 
 
 if __name__ == "__main__":

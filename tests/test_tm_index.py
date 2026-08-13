@@ -125,6 +125,29 @@ class TmIndexTest(unittest.TestCase):
         self.assertEqual(len(tm._norm_lens), 3)
         self.assertEqual(tm.find_matches("二本目", threshold=1.0)[0]["source"], "二本目")
 
+    def test_add_replace_false_keeps_old_target(self):
+        """批量建库默认行为：同键旧译文优先保留，新译文不覆盖。"""
+        tm = self._tm([{"source": "ＭＲ２５０になった", "target": "迈入大师等级250",
+                        "context": "c1", "file": "旧文件"}])
+        tm.add([{"source": "ＭＲ２５０になった", "target": "大师等级达到250级",
+                 "context": "c1", "file": "新文件"}])
+        self.assertEqual(len(tm._entries), 1)
+        self.assertEqual(tm._entries[0]["target"], "迈入大师等级250")
+        self.assertEqual(len(tm._norm_lens), len(tm._entries))
+
+    def test_add_replace_true_updates_same_key(self):
+        """提交积累使用 replace=True：同键新译文覆盖旧译文，条目数不变且索引可查。"""
+        tm = self._tm([{"source": "ＭＲ２５０になった", "target": "迈入大师等级250",
+                        "context": "c1", "file": "旧文件"}])
+        tm.add([{"source": "ＭＲ２５０になった", "target": "大师等级达到250级",
+                 "context": "c1", "file": "新文件"}], replace=True)
+        self.assertEqual(len(tm._entries), 1)
+        self.assertEqual(tm._entries[0]["target"], "大师等级达到250级")
+        self.assertEqual(tm._entries[0]["file"], "新文件")
+        self.assertEqual(len(tm._norm_lens), len(tm._entries))
+        got = tm.find_matches("ＭＲ２５０になった", threshold=1.0)
+        self.assertEqual(got[0]["target"], "大师等级达到250级")
+
     def test_result_deterministic_across_hash_seeds(self):
         """跨进程 PYTHONHASHSEED 不同时，截断边界不因 set 哈希随机化漂移。"""
         entries = []

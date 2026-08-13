@@ -71,18 +71,39 @@ class TranslationMemory:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         json.dump({"entries": self._entries}, open(self._path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-    def add(self, entries: list[dict], dedup: bool = True):
+    def add(self, entries: list[dict], dedup: bool = True, replace: bool = False):
+        """追加条目；dedup=True 按 (source, context) 去重。
+
+        replace=True 时同键旧条目被新译文覆盖（用于提交后积累最新确认译文）；
+        否则同键旧条目优先保留（用于批量建库，保持来源优先级）。
+        """
         self.load()
         added: list[dict] = []
         if dedup:
-            existing = {(e["source"], e.get("context", "")) for e in self._entries}
+            existing = {}
+            for i, e in enumerate(self._entries):
+                existing.setdefault(
+                    (e.get("source", "").strip(), e.get("context", "").strip()), i
+                )
+            replaced = 0
             for e in entries:
                 k = (e.get("source", "").strip(), e.get("context", "").strip())
-                if k not in existing:
-                    entry = {"source": e.get("source", ""), "target": e.get("target", ""), "context": e.get("context", ""), "file": e.get("file", "")}
+                entry = {
+                    "source": e.get("source", ""),
+                    "target": e.get("target", ""),
+                    "context": e.get("context", ""),
+                    "file": e.get("file", ""),
+                }
+                idx = existing.get(k)
+                if idx is None:
                     self._entries.append(entry)
-                    existing.add(k)
+                    existing[k] = len(self._entries) - 1
                     added.append(entry)
+                elif replace:
+                    self._entries[idx] = entry
+                    replaced += 1
+            if replaced:
+                print(f"ℹ️ TM 更新 {replaced} 条同键旧译文（replace=True）")
         else:
             self._entries.extend(entries)
             added = list(entries)
