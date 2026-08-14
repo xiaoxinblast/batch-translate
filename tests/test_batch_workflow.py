@@ -554,6 +554,58 @@ class BatchWorkflowTest(unittest.TestCase):
                 batch.cmd_submit(result)
         self.assertEqual({path: path.read_bytes() for path in tracked}, before)
 
+    def test_layered_tm_keeps_permanent_read_only_and_runtime_per_batch(self):
+        source = self.base / "layered.mqxliff"
+        source.write_text(_MINI_MQ.replace("二", "一"), encoding="utf-8")
+        permanent = self.base / "permanent.json"
+        permanent.write_text(
+            json.dumps({"entries": [{
+                "source": "一", "target": "权威", "context": "", "file": "master"
+            }]}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        permanent_before = permanent.read_bytes()
+
+        project_id = batch.cmd_init(
+            source,
+            batch_chars=1,
+            tm_permanent_path=permanent,
+        )
+        batch.cmd_next()
+        first = self._write_result(project_id, 1, {"1": "甲"})
+        self._disable_qa(project_id)
+        batch.cmd_submit(first, project_id)
+
+        runtime_dir = self.tool / "data" / project_id / "tm_runtime"
+        runtime_1 = runtime_dir / "_batch_001.json"
+        self.assertTrue(runtime_1.is_file())
+        self.assertEqual(permanent.read_bytes(), permanent_before)
+        self.assertEqual(json.loads(runtime_1.read_text(encoding="utf-8"))["entries"][0]["target"], "甲")
+
+        next_task = self.tool / "exports" / project_id / "_batch_002_to_translate.json"
+        next_data = json.loads(next_task.read_text(encoding="utf-8"))
+        self.assertEqual(next_data["entries"][0]["runtime_tm_matches"][0]["target"], "甲")
+
+        second = self._write_result(project_id, 2, {"2": "乙"})
+        batch.cmd_submit(second, project_id)
+        runtime_2 = runtime_dir / "_batch_002.json"
+        self.assertTrue(runtime_2.is_file())
+        self.assertEqual(permanent.read_bytes(), permanent_before)
+        self.assertEqual(json.loads(runtime_2.read_text(encoding="utf-8"))["entries"][0]["target"], "乙")
+
+    def test_init_rejects_permanent_tm_inside_runtime_directory(self):
+        source = self.base / "unsafe.mqxliff"
+        source.write_text(_MINI_MQ, encoding="utf-8")
+        runtime_dir = self.base / "runtime"
+        permanent = runtime_dir / "permanent.json"
+        with self.assertRaises(SystemExit):
+            batch.cmd_init(
+                source,
+                tm_permanent_path=permanent,
+                tm_runtime_dir=runtime_dir,
+            )
+        self.assertFalse((self.tool / "data" / "unsafe").exists())
+
     def test_state_write_failure_rolls_back_everything(self):
         source = self.base / "state.txt"
         source.write_text("一\n二\n", encoding="utf-8")

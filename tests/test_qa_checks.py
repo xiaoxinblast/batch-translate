@@ -47,6 +47,38 @@ class QaChecksTest(unittest.TestCase):
 
         self.assertEqual(result["findings"], [])
 
+    def test_permanent_exact_tm_wins_over_runtime_exact_tm(self):
+        expected = [{
+            "id": "1",
+            "source": "こんにちは",
+            "tm_matches": [{"similarity": 1.0, "target": "永久译文"}],
+            "runtime_tm_matches": [{"similarity": 1.0, "target": "运行期译文"}],
+        }]
+
+        permanent_result = run_qa(
+            [{"id": "1", "target": "永久译文"}],
+            expected,
+        )
+        self.assertEqual(permanent_result["findings"], [])
+
+        runtime_result = run_qa(
+            [{"id": "1", "target": "运行期译文"}],
+            expected,
+        )
+        self.assertEqual(runtime_result["findings"][0]["tm_scope"], "permanent")
+
+    def test_runtime_exact_tm_is_used_without_permanent_exact_match(self):
+        expected = [{
+            "id": "1",
+            "source": "こんにちは",
+            "runtime_tm_matches": [{"similarity": 1.0, "target": "你好"}],
+        }]
+        result = run_qa(
+            [{"id": "1", "target": "您好"}],
+            expected,
+        )
+        self.assertEqual(result["findings"][0]["tm_scope"], "runtime")
+
     def test_newline_check_is_opt_in(self):
         expected = [{"id": "1", "source": "第一行\n第二行"}]
         results = [{"id": "1", "target": "第一行 第二行"}]

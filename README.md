@@ -17,8 +17,8 @@ mqxliff（MemoQ） · docx · xlsx · xlsm · txt · csv/tsv（按整行处理�
 ## 手动使用
 
 ```bash
-# 1. 初始化（自动检测格式）
-python batch_translate/batch.py init <源文件> --batch-chars 6000
+# 1. 初始化（自动检测格式；--tm-permanent 指向用户指定的永久 TM）
+python batch_translate/batch.py init <源文件> --batch-chars 6000 --tm-permanent data/tm_memory.json
 
 # 2. 获取当前批次
 python batch_translate/batch.py next
@@ -55,13 +55,20 @@ python batch_translate/batch.py context-pack <part-report...> --project <project
 |------|------|
 | `data/style_guide.txt` | 翻译风格指南（共享） |
 | `data/term_base.xlsx` | 术语表：原文(ja) / 译文(zh) / 注释（共享） |
-| `data/tm_memory.json` | 翻译记忆（共享，自动积累） |
+| `data/<project-id>/tm_runtime/_batch_NNN.json` | 当前项目每批独立的运行期 TM（自动生成） |
 | `data/<project-id>/` | 工作副本、身份记录和状态（同名源文件自动隔离） |
 | `exports/<project-id>/` | 批次 JSON、语境分片和完成清单 |
 
+用户指定的永久 TM（例如 `data/tm_memory.json`）由 `init --tm-permanent`（旧别名 `--tm`）载入，
+只读且优先级高于运行期 TM。每次批次提交只写入自己的 `_batch_NNN.json`，两层不会合并。
+
 用户指定的源文件始终只读；最终结果由 `export` 写入独立文件。DOCX 支持正文、所有表格单元格、嵌套表格、页眉和页脚，并使用位置 ID 防止清空段落后编号漂移；文本框会明确报告为未支持内容。
 
-## 翻译记忆
+## 分层翻译记忆
+
+`--tm-permanent`（旧别名 `--tm`）指定永久/权威 TM。它只读，提交不会覆盖或追加。
+提交第 N 批时，工具包会在 `data/<project-id>/tm_runtime/_batch_NNN.json` 写入该批确认译文；
+后续批次和校对会同时读取两层，永久层优先。运行期文件彼此独立，完成后仍保留在项目目录中。
 
 ### 整句匹配
 基于 difflib.SequenceMatcher 的整句模糊匹配，阈值 0.6。高相似度（≥0.85）可直接复用。
@@ -105,7 +112,7 @@ python -m pip install -r requirements.txt
 python batch_translate/batch.py version --json
 ```
 
-当前 workflow protocol 为 8。
+当前 workflow protocol 为 9。
 
 ## 测试
 

@@ -99,6 +99,50 @@ class RefreshTest(unittest.TestCase):
         batch.cmd_refresh(None, None, None, None)
         self._assert_refreshed()
 
+    def test_refresh_with_state_can_override_permanent_tm(self):
+        bt = batch._SCRIPT_DIR
+        state = {
+            "stem": self.STEM,
+            "source_file": str(bt / "data" / self.STEM / f"_working_{self.STEM}.mqxliff"),
+            "tm_path": str(bt / "data" / "tm_memory.json"),
+            "terms_path": str(bt / "data" / "term_base.xlsx"),
+            "style_guide_path": str(bt / "data" / "style_guide.txt"),
+        }
+        (bt / "data" / self.STEM / "batch_state.json").write_text(
+            json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        override = bt / "data" / "override_tm.json"
+        override.write_text(json.dumps({"entries": [{
+            "source": "こんにちは", "target": "覆盖译文", "context": "c1", "file": "override"
+        }]}, ensure_ascii=False), encoding="utf-8")
+        self.addCleanup((bt / "data" / self.STEM / "batch_state.json").unlink, missing_ok=True)
+        self.addCleanup(override.unlink, missing_ok=True)
+
+        batch.cmd_refresh(None, str(override), None, None)
+        data = json.loads(self._working_path().read_text(encoding="utf-8"))
+        self.assertEqual(data["entries"][0]["tm_matches"][0]["target"], "覆盖译文")
+
+    def test_refresh_after_completion_uses_manifest_tm_layers(self):
+        bt = batch._SCRIPT_DIR
+        runtime_dir = bt / "data" / self.STEM / "tm_runtime"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        runtime = runtime_dir / "_batch_001.json"
+        runtime.write_text(json.dumps({"entries": [{
+            "source": "こんにちは", "target": "运行期译文", "context": "", "file": "batch-1"
+        }]}, ensure_ascii=False), encoding="utf-8")
+        manifest = bt / "exports" / self.STEM / "project_manifest.json"
+        manifest.write_text(json.dumps({
+            "source_file": str(bt / "data" / self.STEM / f"_working_{self.STEM}.mqxliff"),
+            "tm_permanent_path": str(bt / "data" / "tm_memory.json"),
+            "tm_runtime_dir": str(runtime_dir),
+            "tm_runtime_files": [str(runtime)],
+        }, ensure_ascii=False), encoding="utf-8")
+        self.addCleanup(runtime.unlink, missing_ok=True)
+        self.addCleanup(manifest.unlink, missing_ok=True)
+
+        batch.cmd_refresh(None, None, None, None)
+        data = json.loads(self._working_path().read_text(encoding="utf-8"))
+        self.assertEqual(data["entries"][0]["runtime_tm_matches"][0]["target"], "运行期译文")
+
 
 if __name__ == "__main__":
     unittest.main()

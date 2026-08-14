@@ -16,7 +16,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from validation import (
     effective_entry_policy,
@@ -298,30 +298,124 @@ def _build_parse_args(work_file: Path, export_file: Path, state: dict) -> list[s
     return args
 
 
-def _accumulate_tm(export_file: Path, tm_path: str):
-    """非 mqxliff 格式的 TM 积累。"""
-    try:
-        from tm_store import TranslationMemory
-    except ImportError:
-        return
+def _tm_runtime_dir(state: dict) -> Path:
+    configured = state.get("tm_runtime_dir")
+    if configured:
+        return Path(configured)
+    project_id = state.get("project_id") or state.get("stem") or ".no-project"
+    return _SCRIPT_DIR / "data" / project_id / "tm_runtime"
+
+
+def _tm_runtime_path(state: dict, batch_num: Optional[int] = None) -> Path:
+    number = batch_num if batch_num is not None else state["current_batch"] + 1
+    path = _tm_runtime_dir(state) / f"_batch_{number:03d}.json"
+    permanent = _tm_permanent_path(state)
+    if permanent and os.path.normcase(str(path.resolve())) == os.path.normcase(str(permanent.resolve())):
+        raise ValueError("运行期 TM 路径不能覆盖永久 TM")
+    return path
+
+
+def _tm_runtime_paths(state: dict) -> list[Path]:
+    configured = state.get("tm_runtime_files")
+    paths = [
+        Path(path) for path in configured
+        if isinstance(path, str)
+    ] if isinstance(configured, list) else []
+    # Also discover files on disk so a recovered manifest or a manually
+    # repaired state cannot silently lose an already submitted batch.
+    paths.extend(_tm_runtime_dir(state).glob("_batch_*.json"))
+    unique: dict[str, Path] = {}
+    for path in paths:
+        if path.is_file():
+            unique[os.path.normcase(str(path.resolve()))] = path
+    return sorted(
+        unique.values(),
+        key=lambda path: (_tm_batch_number(path) is None, _tm_batch_number(path) or 0, str(path)),
+    )
+
+
+def _tm_permanent_path(state: dict) -> Optional[Path]:
+    path = state.get("tm_permanent_path") or state.get("tm_path")
+    return Path(path) if path else None
+
+
+def _tm_batch_number(path: Path) -> Optional[int]:
+    match = re.search(r"_batch_(\d+)\.json$", path.name)
+    return int(match.group(1)) if match else None
+
+
+def _tm_entry_from_export(entry: dict, source_file: str) -> Optional[dict]:
+    tgt = entry.get("target", "")
+    src = entry.get("source", "")
+    if not isinstance(tgt, str) or not isinstance(src, str):
+        return None
+    if not tgt.strip() or not src.strip():
+        return None
+    return {
+        "source": src.strip(),
+        "target": tgt.strip(),
+        "context": entry.get("context", ""),
+        "file": source_file,
+    }
+
+
+def _write_runtime_tm(export_file: Path, tm_path: Path, entry_ids: set[str]) -> None:
+    """Write only the submitted batch to its own runtime TM file."""
     with open(export_file, "r", encoding="utf-8") as f:
         data = json.load(f)
-    tm = TranslationMemory(tm_path)
     entries = []
     for e in data.get("entries", []):
-        tgt = e.get("target", "").strip()
-        src = e.get("source", "").strip()
-        if tgt and src:
-            entries.append({
-                "source": src,
-                "target": tgt,
-                "context": e.get("context", ""),
-                "file": data.get("source_file", ""),
-            })
-    if entries:
-        # 提交后的译文是已确认版本，同键旧译文必须被覆盖
-        tm.add(entries, replace=True)
-        tm.save()
+        if str(e.get("id")) not in entry_ids:
+            continue
+        item = _tm_entry_from_export(e, data.get("source_file", ""))
+        if item:
+            entries.append(item)
+    _write_json_atomic(tm_path, {"entries": entries})
+
+
+def _register_runtime_tm(state: dict, runtime_path: Path) -> None:
+    """Record a submitted runtime TM without changing the permanent TM path."""
+    paths = state.get("tm_runtime_files")
+    values = [path for path in paths if isinstance(path, str)] if isinstance(paths, list) else []
+    canonical = str(runtime_path.resolve())
+    if not any(os.path.normcase(str(Path(path).resolve())) == os.path.normcase(canonical) for path in values):
+        values.append(canonical)
+    state["tm_runtime_files"] = sorted(
+        values,
+        key=lambda path: (_tm_batch_number(Path(path)) is None, _tm_batch_number(Path(path)) or 0, path),
+    )
+
+
+def _decorate_tm_match(match: dict, scope: str, batch_num: Optional[int] = None) -> dict:
+    decorated = dict(match)
+    decorated["tm_scope"] = scope
+    if batch_num is not None:
+        decorated["tm_batch"] = batch_num
+    return decorated
+
+
+def _decorate_tm_fragment(match: dict, scope: str, batch_num: Optional[int] = None) -> dict:
+    decorated = dict(match)
+    decorated["tm_scope"] = scope
+    if batch_num is not None:
+        decorated["tm_batch"] = batch_num
+    return decorated
+
+
+def _load_tm_layers(state: dict):
+    from tm_store import TranslationMemory
+
+    layers = []
+    permanent_path = _tm_permanent_path(state)
+    if permanent_path and permanent_path.is_file():
+        permanent = TranslationMemory(permanent_path)
+        permanent.load()
+        layers.append(("permanent", None, permanent))
+    for runtime_path in _tm_runtime_paths(state):
+        runtime = TranslationMemory(runtime_path)
+        runtime.load()
+        layers.append(("runtime", _tm_batch_number(runtime_path), runtime))
+    return layers
 
 
 def _enrich_working_json(json_path: Path, state: dict):
@@ -366,13 +460,14 @@ def _enrich_working_json(json_path: Path, state: dict):
         except Exception as e:
             print(f"⚠️ 术语增强过程出错，跳过: {e}")
 
-    # TM
-    tm_path = state.get("tm_path")
-    if tm_path:
+    # TM：永久/权威层只读，运行期按 batch 分层读取。
+    permanent_path = _tm_permanent_path(state)
+    runtime_paths = _tm_runtime_paths(state)
+    if permanent_path or runtime_paths:
         try:
             sys.path.insert(0, str(_SCRIPT_DIR))
-            from tm_store import TranslationMemory, display_tags
-            tm = TranslationMemory(tm_path)
+            from tm_store import display_tags
+            layers = _load_tm_layers(state)
             import re
             tr = re.compile(r"<[^>]+>")
             entries = data.get("entries", [])
@@ -380,22 +475,77 @@ def _enrich_working_json(json_path: Path, state: dict):
             for e in entries:
                 try:
                     plain = tr.sub("", e.get("source", ""))
-                    matches = tm.find_matches(plain, query_context=e.get("context", ""))
-                    if matches:
-                        e["tm_matches"] = [
-                            {**m, "source": display_tags(m["source"]), "target": display_tags(m["target"])}
-                            for m in matches
-                        ]
-                    # 片段匹配
-                    if not matches or all(m["similarity"] < 0.85 for m in matches):
-                        exclude = {m["source"] for m in matches} if matches else None
-                        frag_matches = tm.find_fragment_matches(plain, exclude_sources=exclude)
-                        if frag_matches:
-                            e["tm_fragments"] = [
-                                {**f, "match_source": display_tags(f["match_source"]),
-                                 "match_target": display_tags(f["match_target"])}
-                                for f in frag_matches
-                            ]
+                    e.pop("tm_matches", None)
+                    e.pop("runtime_tm_matches", None)
+                    e.pop("tm_fragments", None)
+                    e.pop("runtime_tm_fragments", None)
+                    permanent_matches = []
+                    runtime_by_key = {}
+                    permanent_fragments = []
+                    runtime_fragments_by_key = {}
+                    matched_sources = set()
+                    for scope, batch_num, tm in layers:
+                        matches = tm.find_matches(plain, query_context=e.get("context", ""))
+                        for match in matches:
+                            decorated = _decorate_tm_match(
+                                {
+                                    **match,
+                                    "source": display_tags(match["source"]),
+                                    "target": display_tags(match["target"]),
+                                },
+                                scope,
+                                batch_num,
+                            )
+                            matched_sources.add(match["source"])
+                            if scope == "permanent":
+                                permanent_matches.append(decorated)
+                            else:
+                                key = (
+                                    decorated.get("source", ""),
+                                    decorated.get("context", ""),
+                                )
+                                previous = runtime_by_key.get(key)
+                                if previous is None or (batch_num or -1) >= (previous.get("tm_batch") or -1):
+                                    runtime_by_key[key] = decorated
+
+                        if not matches or all(m["similarity"] < 0.85 for m in matches):
+                            fragments = tm.find_fragment_matches(
+                                plain, exclude_sources=matched_sources or None
+                            )
+                            for fragment in fragments:
+                                decorated = _decorate_tm_fragment(
+                                    {
+                                        **fragment,
+                                        "match_source": display_tags(fragment["match_source"]),
+                                        "match_target": display_tags(fragment["match_target"]),
+                                    },
+                                    scope,
+                                    batch_num,
+                                )
+                                key = decorated.get("fragment_source", "")
+                                if scope == "permanent":
+                                    permanent_fragments.append(decorated)
+                                else:
+                                    previous = runtime_fragments_by_key.get(key)
+                                    if previous is None or (batch_num or -1) >= (previous.get("tm_batch") or -1):
+                                        runtime_fragments_by_key[key] = decorated
+
+                    if permanent_matches:
+                        e["tm_matches"] = permanent_matches
+                    runtime_matches = sorted(
+                        runtime_by_key.values(),
+                        key=lambda item: (-item["similarity"], -(item.get("tm_batch") or -1)),
+                    )
+                    if runtime_matches:
+                        e["runtime_tm_matches"] = runtime_matches
+                    if permanent_fragments:
+                        e["tm_fragments"] = permanent_fragments
+                    runtime_fragments = sorted(
+                        runtime_fragments_by_key.values(),
+                        key=lambda item: -(item.get("tm_batch") or -1),
+                    )
+                    if runtime_fragments:
+                        e["runtime_tm_fragments"] = runtime_fragments
                 except Exception as exc:
                     tm_failures += 1
                     if tm_failures <= 3:
@@ -442,7 +592,8 @@ def _build_review_json(
         "逐条核对译文与原文：1)术语是否准确统一 2)标点格式是否符合规范 "
         "3)语气是否符合角色 4)表达是否自然流畅、无翻译腔。"
         + (
-            "每条 entry 可能带有 tm_matches（翻译记忆参考）、tm_fragments（片段匹配参考）和 terms（术语约束），核对时参考。"
+            "tm_matches 是项目永久 TM 的权威参考，runtime_tm_matches 是当前工作流各批临时 TM 的次级参考；"
+            "两者都可能带有 tm_fragments/runtime_tm_fragments 片段匹配参考，另有 terms（术语约束），核对时参考。"
             "每条 entry 的 validation 是该条最终生效的校验规则，标签、长度、换行和空译文均以该对象为准。"
         )
         + ("发现问题直接修正，无需标注。" if review_only else "")
@@ -484,8 +635,12 @@ def _build_review_json(
             item["terms"] = e["terms"]
         if e.get("tm_matches"):
             item["tm_matches"] = e["tm_matches"]
+        if e.get("runtime_tm_matches"):
+            item["runtime_tm_matches"] = e["runtime_tm_matches"]
         if e.get("tm_fragments"):
             item["tm_fragments"] = e["tm_fragments"]
+        if e.get("runtime_tm_fragments"):
+            item["runtime_tm_fragments"] = e["runtime_tm_fragments"]
         if isinstance(e.get("validation"), dict):
             item["validation"] = e["validation"]
         review_entries.append(item)
@@ -513,6 +668,8 @@ def cmd_init(
     resume: bool = False,
     project_id: Optional[str] = None,
     force_reinit: bool = False,
+    tm_permanent_path: Optional[Path] = None,
+    tm_runtime_dir: Optional[Path] = None,
 ) -> str:
     """初始化批量翻译：解析源文件 → 中间 JSON，写入 state。"""
     source_path = source_path.resolve()
@@ -525,6 +682,12 @@ def cmd_init(
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"❌ 项目策略无效: {exc}")
         sys.exit(1)
+
+    if tm_path and tm_permanent_path:
+        if os.path.normcase(str(tm_path.resolve())) != os.path.normcase(str(tm_permanent_path.resolve())):
+            print("❌ --tm 与 --tm-permanent 指向不同文件，请只指定一个永久 TM")
+            sys.exit(1)
+    permanent_tm_path = tm_permanent_path or tm_path
 
     try:
         project_id = _choose_project_id(
@@ -555,6 +718,17 @@ def cmd_init(
         print("   请改用其他 --project，或确认后使用 --force-reinit")
         sys.exit(1)
 
+    work_dir = _SCRIPT_DIR / "data" / stem
+    runtime_dir = (tm_runtime_dir or work_dir / "tm_runtime").resolve()
+    if permanent_tm_path:
+        try:
+            Path(permanent_tm_path).resolve().relative_to(runtime_dir)
+        except ValueError:
+            pass
+        else:
+            print("❌ 永久 TM 不能位于运行期 TM 目录内")
+            sys.exit(1)
+
     identity = {
         "project_id": project_id,
         "source_stem": source_path.stem,
@@ -573,8 +747,8 @@ def cmd_init(
 
     # 复制源文件到工作文件（不动源文件）
     import shutil
-    work_dir = _SCRIPT_DIR / "data" / stem
     work_dir.mkdir(parents=True, exist_ok=True)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
     if resume:
         # resume 时归一为规范工作文件名，避免从 _working_*.mqxliff 再次加前缀
         work_file = work_dir / f"_working_{stem}{source_path.suffix.lower()}"
@@ -653,7 +827,11 @@ def cmd_init(
         "current_batch": 0,
         "document_summary": document_summary,
         "terms_path": str(terms_path.resolve()) if terms_path else None,
-        "tm_path": str(tm_path.resolve()) if tm_path else None,
+        # tm_path remains as a read-only compatibility alias for old callers.
+        "tm_path": str(permanent_tm_path.resolve()) if permanent_tm_path else None,
+        "tm_permanent_path": str(permanent_tm_path.resolve()) if permanent_tm_path else None,
+        "tm_runtime_dir": str(runtime_dir),
+        "tm_runtime_files": [],
         "style_guide_path": str(style_guide_path.resolve()) if style_guide_path else None,
         "validation_policy_path": policy_snapshots["validation_policy_path"],
         "validation_policy": validation_policy,
@@ -817,8 +995,12 @@ def cmd_next(review_only: bool = False, project_arg: Optional[str] = None):
             item["terms"] = e["terms"]
         if e.get("tm_matches"):
             item["tm_matches"] = e["tm_matches"]
+        if e.get("runtime_tm_matches"):
+            item["runtime_tm_matches"] = e["runtime_tm_matches"]
         if e.get("tm_fragments"):
             item["tm_fragments"] = e["tm_fragments"]
+        if e.get("runtime_tm_fragments"):
+            item["runtime_tm_fragments"] = e["runtime_tm_fragments"]
         item["validation"] = effective_entry_policy(
             validation_policy, e["id"]
         )
@@ -866,8 +1048,8 @@ def cmd_next(review_only: bool = False, project_arg: Optional[str] = None):
     batch["instructions"] = (
         "翻译过程中遇到任何不确定的术语、专有名词、角色名、上下文含义时，"
         "不要猜测，应主动搜索项目文件或联网搜索以获取准确信息后，再给出确定译文。"
-        "每条 entry 可能带有 tm_matches（翻译记忆模糊匹配，高相似度可直接复用）"
-        "和 terms（术语库匹配），翻译时优先参考。"
+        "每条 entry 可能带有 tm_matches（项目永久 TM，优先级最高）和 runtime_tm_matches（当前工作流临时 TM，次级参考），"
+        "以及 terms（术语库匹配）；翻译时先参考永久 TM，再参考临时 TM。"
         "每条 entry 的 validation 是该条最终生效的校验规则，标签、长度、换行和空译文均以该对象为准。"
         "最终返回结果必须是干净的译文，不要附加任何标注或说明。"
         + ("\n\n" + instr if instr else "")
@@ -1057,8 +1239,7 @@ def cmd_submit(
 
     import subprocess
     work_file = Path(state["source_file"])
-    tm_path = state.get("tm_path")
-    tm_file = Path(tm_path) if tm_path else None
+    runtime_file = _tm_runtime_path(state)
 
     # 备份与候选文件放在工作文件同一卷，便于最终原子替换。
     with tempfile.TemporaryDirectory(
@@ -1071,10 +1252,10 @@ def cmd_submit(
         shutil.copy2(export_file, export_backup)
         shutil.copy2(work_file, work_backup)
         shutil.copy2(state_path, state_backup)
-        tm_existed = bool(tm_file and tm_file.is_file())
-        tm_backup = temp_dir / "tm.backup.json"
-        if tm_existed and tm_file:
-            shutil.copy2(tm_file, tm_backup)
+        runtime_existed = runtime_file.is_file()
+        runtime_backup = temp_dir / "runtime_tm.backup.json"
+        if runtime_existed:
+            shutil.copy2(runtime_file, runtime_backup)
         manifest_path = (
             _SCRIPT_DIR / "exports" / state["stem"] / "project_manifest.json"
         )
@@ -1108,9 +1289,13 @@ def cmd_submit(
                     "--output",
                     str(candidate_work),
                 ]
-                if tm_path:
-                    import_args += ["--save-tm", str(tm_path)]
                 subprocess.run(import_args, check=True)
+
+                _write_runtime_tm(
+                    merged_file,
+                    runtime_file,
+                    set(result_map),
+                )
 
                 if state.get("existing_targets") == state["total"]:
                     committed_export = merged_file
@@ -1127,8 +1312,11 @@ def cmd_submit(
                 os.replace(committed_export, export_file)
             else:
                 # 单列/表格格式保持原始工作副本不变，最终 export 时一次写回。
-                if tm_path:
-                    _accumulate_tm(merged_file, tm_path)
+                _write_runtime_tm(
+                    merged_file,
+                    runtime_file,
+                    set(result_map),
+                )
                 _enrich_working_json(merged_file, state)
                 os.replace(merged_file, export_file)
 
@@ -1153,6 +1341,7 @@ def cmd_submit(
             ):
                 state.pop(key, None)
             state["current_batch"] += 1
+            _register_runtime_tm(state, runtime_file)
             _save_state(state)
             completed = state["current_batch"] >= len(state["batches"])
             if completed:
@@ -1172,14 +1361,13 @@ def cmd_submit(
                     shutil.copy2(backup, destination)
                 except Exception as rollback_exc:
                     rollback_errors.append(f"{destination}: {rollback_exc}")
-            if tm_file:
-                try:
-                    if tm_existed:
-                        shutil.copy2(tm_backup, tm_file)
-                    else:
-                        tm_file.unlink(missing_ok=True)
-                except Exception as rollback_exc:
-                    rollback_errors.append(f"{tm_file}: {rollback_exc}")
+            try:
+                if runtime_existed:
+                    shutil.copy2(runtime_backup, runtime_file)
+                else:
+                    runtime_file.unlink(missing_ok=True)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"{runtime_file}: {rollback_exc}")
             try:
                 if manifest_existed:
                     shutil.copy2(manifest_backup, manifest_path)
@@ -1192,7 +1380,7 @@ def cmd_submit(
                 for message in rollback_errors:
                     print(f"   - {message}")
             else:
-                print("❌ 提交失败，工作文件、JSON 与 TM 已完整回滚，状态未推进。")
+                print("❌ 提交失败，工作文件、JSON 与当前批临时 TM 已完整回滚，状态未推进；永久 TM 未写入。")
             raise
 
     print(f"   已提交 {merged} 条 → {export_file.name}")
@@ -1375,6 +1563,7 @@ def cmd_qa(project_arg: Optional[str] = None):
             "逐条查看 findings。确认是真问题时修正 target 并标记 fixed；"
             "确认是误报时原样保留 target 并标记 false_positive。"
             "必须处理全部 finding，严禁修改 locked 或 source_locked 条目。"
+            "精确 TM finding 优先参考永久 tm_matches；runtime_tm_matches 仅作次级参考。"
         ),
         "document_summary": source_task_data.get("document_summary", state.get("document_summary", "")),
         "style_guide": source_task_data.get("style_guide", export_data.get("style_guide", "")),
@@ -1526,12 +1715,20 @@ def cmd_status(project_arg: Optional[str] = None):
         print(f"进度: {state['total']}/{state['total']} 条（全部完成）")
     print(f"每批 ~{state['batch_chars']} 字, 上下文: {state['context_size']} 条")
     print(f"源文件: {state.get('source_file', state.get('mqxliff_file', 'unknown'))}")
-    if state.get('tm_path'):
-        tm = Path(state['tm_path'])
-        if tm.is_file():
-            with open(tm, encoding='utf-8') as f:
-                tm_data = json.load(f)
-            print(f"TM: {len(tm_data['entries'])} 条")
+    permanent = _tm_permanent_path(state)
+    if permanent and permanent.is_file():
+        with open(permanent, encoding="utf-8") as f:
+            tm_data = json.load(f)
+        print(f"永久 TM: {len(tm_data.get('entries', []))} 条（只读）")
+    runtime_paths = _tm_runtime_paths(state)
+    runtime_count = 0
+    for runtime_path in runtime_paths:
+        try:
+            with open(runtime_path, encoding="utf-8") as f:
+                runtime_count += len(json.load(f).get("entries", []))
+        except (OSError, json.JSONDecodeError, AttributeError):
+            print(f"⚠️ 临时 TM 文件无法读取: {runtime_path}")
+    print(f"运行期 TM: {len(runtime_paths)} 个批次文件，共 {runtime_count} 条")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1583,7 +1780,8 @@ def cmd_refresh(
 
     适用于 init 时增强中断/不完整，或 TM/术语库更新后刷新参考。
     有 state 时复用 state 记录的路径；state 已清理（全部提交完成）时
-    默认使用 batch_translate/data/ 下的编译产物，可用 --tm/--terms/--style-guide 覆盖。
+    默认使用项目 manifest 或 batch_translate/data/ 下的编译产物，可用
+    --tm-permanent/--terms/--style-guide 覆盖永久 TM、术语库和风格指南。
     注意：以工作 mqxliff 为事实源重新 parse，若手工只改过 _working.json
     而未写回 mqxliff，这些改动不会保留。
     """
@@ -1594,9 +1792,15 @@ def cmd_refresh(
         with open(state_path, "r", encoding="utf-8") as f:
             state = json.load(f)
         work_file = Path(state["source_file"])
+        permanent_override = str(Path(tm_arg).resolve()) if tm_arg else None
         enrich_state = {
+            "project_id": state.get("project_id") or state.get("stem") or stem,
+            "stem": state.get("stem") or stem,
             "terms_path": state.get("terms_path"),
-            "tm_path": state.get("tm_path"),
+            "tm_path": permanent_override or state.get("tm_path"),
+            "tm_permanent_path": permanent_override or state.get("tm_permanent_path") or state.get("tm_path"),
+            "tm_runtime_dir": state.get("tm_runtime_dir"),
+            "tm_runtime_files": state.get("tm_runtime_files", []),
             "style_guide_path": state.get("style_guide_path"),
             "source_col": state.get("source_col", "A"),
             "target_col": state.get("target_col", "B"),
@@ -1604,12 +1808,37 @@ def cmd_refresh(
             "sheet_name": state.get("sheet_name"),
         }
     else:
-        work_file = _SCRIPT_DIR / "data" / stem / f"_working_{stem}.mqxliff"
+        manifest_path = _SCRIPT_DIR / "exports" / stem / "project_manifest.json"
+        manifest = {}
+        if manifest_path.is_file():
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    manifest = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                manifest = {}
+        recorded_work_file = manifest.get("source_file")
+        work_file = Path(recorded_work_file) if recorded_work_file else Path()
+        if not work_file.is_file():
+            candidates = sorted((_SCRIPT_DIR / "data" / stem).glob(f"_working_{stem}.*"))
+            work_file = candidates[0] if candidates else work_file
+        permanent_tm = (
+            tm_arg
+            or manifest.get("tm_permanent_path")
+            or manifest.get("tm_path")
+            or str(_SCRIPT_DIR / "data" / "tm_memory.json")
+        )
+        runtime_dir = manifest.get("tm_runtime_dir") or str(
+            _SCRIPT_DIR / "data" / stem / "tm_runtime"
+        )
         enrich_state = {
+            "project_id": stem,
+            "stem": stem,
             "terms_path": str(Path(terms_arg).resolve()) if terms_arg
                          else str(_SCRIPT_DIR / "data" / "term_base.xlsx"),
-            "tm_path": str(Path(tm_arg).resolve()) if tm_arg
-                       else str(_SCRIPT_DIR / "data" / "tm_memory.json"),
+            "tm_path": str(Path(permanent_tm).resolve()) if permanent_tm else None,
+            "tm_permanent_path": str(Path(permanent_tm).resolve()) if permanent_tm else None,
+            "tm_runtime_dir": str(Path(runtime_dir).resolve()),
+            "tm_runtime_files": manifest.get("tm_runtime_files", []),
             "style_guide_path": str(Path(style_guide_arg).resolve()) if style_guide_arg
                                 else str(_SCRIPT_DIR / "data" / "style_guide.txt"),
             "source_col": "A",
@@ -1621,7 +1850,7 @@ def cmd_refresh(
     if not work_file.is_file():
         print(f"❌ 工作文件不存在: {work_file}")
         sys.exit(1)
-    for key, label in (("terms_path", "术语库"), ("tm_path", "TM"),
+    for key, label in (("terms_path", "术语库"), ("tm_permanent_path", "永久 TM"),
                        ("style_guide_path", "风格指南")):
         p = enrich_state.get(key)
         if p and not Path(p).is_file():
@@ -1921,7 +2150,9 @@ def main():
     p_init.add_argument("--batch-chars", type=int, default=3000, help="每批字数阈值（默认 3000）")
     p_init.add_argument("--context-size", type=int, default=5, help="上文条数（默认 5）")
     p_init.add_argument("--terms", type=str, default=None, help="术语库 xlsx 路径")
-    p_init.add_argument("--tm", type=str, default=None, help="翻译记忆 JSON 路径")
+    p_init.add_argument("--tm", type=str, default=None, help="永久 TM JSON 路径（兼容旧参数名）")
+    p_init.add_argument("--tm-permanent", type=str, default=None, help="用户指定的永久/权威 TM JSON 路径")
+    p_init.add_argument("--tm-runtime-dir", type=str, default=None, help="运行期 TM 目录（默认 data/<project-id>/tm_runtime）")
     p_init.add_argument("--style-guide", type=str, default=None, help="风格指南 txt 路径")
     p_init.add_argument("--source-col", type=str, default="A", help="xlsx 源列（默认 A）")
     p_init.add_argument("--target-col", type=str, default="B", help="xlsx 目标列（默认 B）")
@@ -1990,8 +2221,8 @@ def main():
     add_project_argument(p_summary)
     p_refresh = sub.add_parser("refresh", help="重新解析工作文件并重跑术语/TM/风格指南增强")
     add_project_argument(p_refresh)
-    p_refresh.add_argument("--tm", type=str, default=None,
-                           help="TM JSON 路径（state 不存在时默认 data/tm_memory.json）")
+    p_refresh.add_argument("--tm", "--tm-permanent", dest="tm", type=str, default=None,
+                           help="永久 TM JSON 路径（state 不存在时默认 data/tm_memory.json）")
     p_refresh.add_argument("--terms", type=str, default=None,
                            help="术语库 xlsx 路径（state 不存在时默认 data/term_base.xlsx）")
     p_refresh.add_argument("--style-guide", type=str, default=None,
@@ -2027,6 +2258,8 @@ def main():
             context_size=args.context_size,
             terms_path=Path(args.terms) if args.terms else None,
             tm_path=Path(args.tm) if args.tm else None,
+            tm_permanent_path=Path(args.tm_permanent) if args.tm_permanent else None,
+            tm_runtime_dir=Path(args.tm_runtime_dir) if args.tm_runtime_dir else None,
             style_guide_path=Path(args.style_guide) if args.style_guide else None,
             qa_policy_path=Path(args.qa_policy) if args.qa_policy else None,
             source_col=args.source_col,

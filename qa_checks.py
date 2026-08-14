@@ -290,27 +290,41 @@ def run_qa(
 
         enabled, severity = _rule_enabled(policy, entry, "tm_exact_target_mismatch")
         if enabled:
-            exact = []
+            permanent_exact = []
             for match in entry.get("tm_matches", []) or []:
                 try:
                     similarity = float(match.get("similarity", 0))
                 except (TypeError, ValueError):
                     continue
                 if similarity == 1.0 and str(match.get("target", "")).strip():
-                    exact.append(match)
+                    permanent_exact.append(match)
+            # A permanent exact match is authoritative. Runtime matches are
+            # consulted only when the permanent layer has no exact candidate.
+            exact = permanent_exact
+            tm_scope = "permanent"
+            if not exact:
+                exact = []
+                tm_scope = "runtime"
+                for match in entry.get("runtime_tm_matches", []) or []:
+                    try:
+                        similarity = float(match.get("similarity", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if similarity == 1.0 and str(match.get("target", "")).strip():
+                        exact.append(match)
             candidate_targets = sorted({_normal_text(match.get("target", "")) for match in exact})
             current = _normal_text(target)
             if candidate_targets and current not in candidate_targets:
                 _append_if_enabled(
                     findings, policy, entry, "tm_exact_target_mismatch",
-                    "存在精确 TM 匹配，但当前译文与所有精确 TM 译文不一致",
-                    tm_targets=candidate_targets,
+                    f"存在精确{tm_scope} TM 匹配，但当前译文与所有精确 TM 译文不一致",
+                    tm_targets=candidate_targets, tm_scope=tm_scope,
                 )
             elif len(candidate_targets) > 1:
                 _append_if_enabled(
                     findings, policy, entry, "tm_exact_target_mismatch",
-                    "多个精确 TM 匹配之间的译文互相冲突",
-                    tm_targets=candidate_targets,
+                    f"多个精确{tm_scope} TM 匹配之间的译文互相冲突",
+                    tm_targets=candidate_targets, tm_scope=tm_scope,
                 )
 
         patterns = effective_qa_policy(policy, entry.get("id", ""))["protected_patterns"]
