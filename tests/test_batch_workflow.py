@@ -72,7 +72,18 @@ class BatchWorkflowTest(unittest.TestCase):
             )
         )
 
+    def _disable_qa(self, stem: str) -> None:
+        """Keep legacy transaction tests focused on write/rollback behavior."""
+        state_path = self.tool / "data" / stem / "batch_state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["qa_required"] = False
+        state["qa_status"] = "not_started"
+        state_path.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
     def _write_result(self, stem: str, batch_num: int, targets: dict[str, str]) -> Path:
+        self._disable_qa(stem)
         task = json.loads(
             (self.tool / "exports" / stem / f"_batch_{batch_num:03d}_to_translate.json")
             .read_text(encoding="utf-8")
@@ -220,6 +231,7 @@ class BatchWorkflowTest(unittest.TestCase):
         )
         batch.cmd_init(source, validation_policy_path=policy)
         batch.cmd_next(review_only=True)
+        self._disable_qa("clear")
         result = self.base / "clear-result.json"
         result.write_text(
             json.dumps([
@@ -239,11 +251,126 @@ class BatchWorkflowTest(unittest.TestCase):
         self.assertEqual(next(unit for unit in units if unit.id == "1").target_text, "")
         self.assertEqual(next(unit for unit in units if unit.id == "2").target_text, "译文二")
 
+    def test_translate_submit_requires_review_and_qa(self):
+        source = self.base / "qa_gate.txt"
+        source.write_text("原文\n", encoding="utf-8")
+        batch.cmd_init(source)
+        batch.cmd_next()
+        result = self.base / "qa-gate-result.json"
+        result.write_text(
+            json.dumps([{"id": "1", "target": "译文"}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(SystemExit):
+            batch.cmd_submit(result)
+        state = self._state("qa_gate")
+        self.assertEqual(state["qa_status"], "awaiting_translation")
+        self.assertEqual(state["current_batch"], 0)
+
+    def test_clean_qa_rejects_changed_reviewed_baseline(self):
+        source = self.base / "qa_clean.txt"
+        source.write_text("原文\n", encoding="utf-8")
+        batch.cmd_init(source)
+        batch.cmd_next()
+        translation = self.base / "qa-clean-translation.json"
+        translation.write_text(
+            json.dumps([{"id": "1", "target": "译文"}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        batch.cmd_review(translation)
+        reviewed = self.tool / "exports" / "qa_clean" / "_batch_001_reviewed.json"
+        reviewed.write_text(
+            json.dumps([{"id": "1", "target": "译文"}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        batch.cmd_qa("qa_clean")
+
+        reviewed.write_text(
+            json.dumps([{"id": "1", "target": "改后"}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        with self.assertRaises(SystemExit):
+            batch.cmd_submit(reviewed, "qa_clean")
+
+    def test_qa_reviewer_fixes_machine_finding_before_commit(self):
+        source = self.base / "qa.txt"
+        source.write_text("こんにちは\n", encoding="utf-8")
+        original = source.read_bytes()
+        batch.cmd_init(source)
+        batch.cmd_next()
+
+        translation = self.base / "qa-translation.json"
+        translation.write_text(
+            json.dumps([{"id": "1", "target": "こんにちは"}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        batch.cmd_review(translation)
+
+        reviewed = self.tool / "exports" / "qa" / "_batch_001_reviewed.json"
+        reviewed.write_text(
+            json.dumps([{"id": "1", "target": "こんにちは"}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        batch.cmd_qa("qa")
+        qa_task = json.loads(
+            (self.tool / "exports" / "qa" / "_batch_001_qa_task.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        finding = qa_task["findings"][0]
+        qa_result = Path(qa_task["qa_reviewed_path"])
+        report = Path(qa_task["qa_report_path"])
+        alternate_result = self.base / "qa-reviewed.json"
+        alternate_report = self.base / "qa-report.json"
+        alternate_result.write_text(
+            json.dumps([{"id": "1", "target": "你好"}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        alternate_report.write_text(
+            json.dumps({"schema_version": 1, "findings": []}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        with self.assertRaises(SystemExit):
+            batch.cmd_qa_submit(alternate_result, alternate_report, "qa")
+        qa_result.write_text(
+            json.dumps([{"id": "1", "target": "你好"}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        report.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "findings": [
+                        {
+                            "finding_id": finding["finding_id"],
+                            "id": "1",
+                            "status": "fixed",
+                            "reason": "原文仍为日文，已改为中文译文",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        batch.cmd_qa_submit(qa_result, report, "qa")
+
+        manifest = json.loads(
+            (self.tool / "exports" / "qa" / "project_manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(manifest["qa_history"][0]["status"], "agent_reviewed")
+        self.assertEqual(source.read_bytes(), original)
+
     def test_out_of_batch_id_is_rejected_without_file_changes(self):
         source = self.base / "ids.txt"
         source.write_text("一\n二\n", encoding="utf-8")
         batch.cmd_init(source, batch_chars=1)
         batch.cmd_next()
+        self._disable_qa("ids")
         state = self._state("ids")
         tracked = [
             source,
@@ -309,6 +436,7 @@ class BatchWorkflowTest(unittest.TestCase):
         source.write_text("原文\n", encoding="utf-8")
         batch.cmd_init(source)
         batch.cmd_next()
+        self._disable_qa("warnings")
         wrapped = self.base / "wrapped.json"
         wrapped.write_text(
             json.dumps({"entries": [{"id": "1", "target": "译文"}]}, ensure_ascii=False),
@@ -403,6 +531,7 @@ class BatchWorkflowTest(unittest.TestCase):
         tm.write_text('{"entries": []}', encoding="utf-8")
         batch.cmd_init(source, batch_chars=1, tm_path=tm)
         batch.cmd_next()
+        self._disable_qa("rollback")
         state = self._state("rollback")
         tracked = [
             source,
@@ -430,6 +559,7 @@ class BatchWorkflowTest(unittest.TestCase):
         source.write_text("一\n二\n", encoding="utf-8")
         batch.cmd_init(source, batch_chars=1)
         batch.cmd_next()
+        self._disable_qa("state")
         state = self._state("state")
         state_path = self.tool / "data" / "state" / "batch_state.json"
         tracked = [source, Path(state["source_file"]), Path(state["export_file"]), state_path]

@@ -1,4 +1,4 @@
 """Public version contract for the batch-translate toolkit."""
 
-TOOLKIT_VERSION = "7.0.0"
-WORKFLOW_PROTOCOL_VERSION = 7
+TOOLKIT_VERSION = "8.0.0"
+WORKFLOW_PROTOCOL_VERSION = 8

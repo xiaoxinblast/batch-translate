@@ -23,6 +23,7 @@ from validation import (
     load_validation_policy,
     validate_batch_results,
 )
+from qa_checks import load_qa_policy, run_qa, validate_qa_report
 from toolkit_version import TOOLKIT_VERSION, WORKFLOW_PROTOCOL_VERSION
 
 if sys.platform == "win32":
@@ -211,6 +212,60 @@ def _write_json_atomic(path: Path, data) -> None:
             pass
         Path(temp_name).unlink(missing_ok=True)
         raise
+
+
+def _sha256_file(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _project_rules_dir(project_id: str) -> Path:
+    return _SCRIPT_DIR / "data" / project_id / "project_rules"
+
+
+def _write_project_policy_snapshots(
+    project_id: str,
+    validation_policy: dict,
+    qa_policy: dict,
+    validation_source: Optional[Path],
+    qa_source: Optional[Path],
+) -> dict[str, str]:
+    """Persist effective policies outside the Git-tracked toolkit code."""
+    rules_dir = _project_rules_dir(project_id)
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    validation_path = rules_dir / "validation_policy.json"
+    qa_path = rules_dir / "qa_policy.json"
+    manifest_path = rules_dir / "policy_manifest.json"
+    _write_json_atomic(validation_path, validation_policy)
+    _write_json_atomic(qa_path, qa_policy)
+    manifest = {
+        "schema_version": 1,
+        "project_id": project_id,
+        "workflow_protocol": WORKFLOW_PROTOCOL_VERSION,
+        "sources": {
+            "validation_policy": {
+                "path": str(validation_source.resolve()) if validation_source else "built-in-default",
+                "sha256": _sha256_file(validation_source) if validation_source else None,
+            },
+            "qa_policy": {
+                "path": str(qa_source.resolve()) if qa_source else "built-in-default",
+                "sha256": _sha256_file(qa_source) if qa_source else None,
+            },
+        },
+        "approved": False,
+        "approval_note": "默认策略快照；项目例外需经用户确认后更新",
+    }
+    _write_json_atomic(manifest_path, manifest)
+    return {
+        "validation_policy_path": str(validation_path.resolve()),
+        "qa_policy_path": str(qa_path.resolve()),
+        "policy_manifest_path": str(manifest_path.resolve()),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -449,6 +504,7 @@ def cmd_init(
     terms_path: Optional[Path] = None,
     tm_path: Optional[Path] = None,
     style_guide_path: Optional[Path] = None,
+    qa_policy_path: Optional[Path] = None,
     source_col: str = "A",
     target_col: str = "B",
     header_row: int = 1,
@@ -465,8 +521,9 @@ def cmd_init(
         sys.exit(1)
     try:
         validation_policy = load_validation_policy(validation_policy_path)
+        qa_policy = load_qa_policy(qa_policy_path)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        print(f"❌ 验证策略无效: {exc}")
+        print(f"❌ 项目策略无效: {exc}")
         sys.exit(1)
 
     try:
@@ -505,6 +562,14 @@ def cmd_init(
         "input_source_file": str(source_path.resolve()),
     }
     _write_json_atomic(_project_identity_path(project_id), identity)
+
+    policy_snapshots = _write_project_policy_snapshots(
+        project_id,
+        validation_policy,
+        qa_policy,
+        validation_policy_path,
+        qa_policy_path,
+    )
 
     # 复制源文件到工作文件（不动源文件）
     import shutil
@@ -590,10 +655,13 @@ def cmd_init(
         "terms_path": str(terms_path.resolve()) if terms_path else None,
         "tm_path": str(tm_path.resolve()) if tm_path else None,
         "style_guide_path": str(style_guide_path.resolve()) if style_guide_path else None,
-        "validation_policy_path": (
-            str(validation_policy_path.resolve()) if validation_policy_path else None
-        ),
+        "validation_policy_path": policy_snapshots["validation_policy_path"],
         "validation_policy": validation_policy,
+        "qa_policy_path": policy_snapshots["qa_policy_path"],
+        "qa_policy": qa_policy,
+        "policy_manifest_path": policy_snapshots["policy_manifest_path"],
+        "qa_required": True,
+        "qa_status": "not_started",
         "source_col": source_col,
         "target_col": target_col,
         "header_row": header_row,
@@ -712,6 +780,11 @@ def cmd_next(review_only: bool = False, project_arg: Optional[str] = None):
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(review, f, ensure_ascii=False, indent=2)
 
+        state["qa_status"] = "awaiting_review"
+        state["qa_batch"] = batch_num
+        state["qa_input_sha256"] = None
+        _save_state(state)
+
         existing = sum(1 for e in review["entries"] if e["translated"])
         print(f"📝 Batch {batch_num}/{state['total_batches']}  条目 {start + 1}-{end}（共 {total} 条）")
         print(f"   模式: 校对（跳过翻译）")
@@ -719,8 +792,9 @@ def cmd_next(review_only: bool = False, project_arg: Optional[str] = None):
         print(f"   其中 {existing}/{len(review['entries'])} 条已有译文")
         if context_entries:
             print(f"   上文: {len(context_entries)} 条")
-        print(f"   校对后请将修正结果保存为 JSON，运行:")
-        print(f"   python batch_translate/batch.py submit <reviewed.json>")
+        reviewed_path = _current_reviewed_path(state)
+        print(f"   校对后请将修正结果保存为: {reviewed_path}")
+        print(f"   python batch_translate/batch.py qa --project {state['stem']}")
         return
 
     # ── 翻译模式 ──
@@ -812,6 +886,11 @@ def cmd_next(review_only: bool = False, project_arg: Optional[str] = None):
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(batch, f, ensure_ascii=False, indent=2)
 
+    state["qa_status"] = "awaiting_translation"
+    state["qa_batch"] = batch_num
+    state["qa_input_sha256"] = None
+    _save_state(state)
+
     print(f"📤 Batch {batch_num}/{state['total_batches']}  条目 {start + 1}-{end}（共 {total} 条）")
     if locked_count > 0:
         locked_details = []
@@ -827,7 +906,7 @@ def cmd_next(review_only: bool = False, project_arg: Optional[str] = None):
     if context_entries:
         print(f"   上文: {len(context_entries)} 条（id={context_entries[0]['id']}-{context_entries[-1]['id']}）")
     print(f"   翻译后请将结果保存为 JSON，运行:")
-    print(f"   python batch_translate/batch.py submit <result.json>")
+    print(f"   python batch_translate/batch.py review <translation.json> --project {state['stem']}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -899,14 +978,31 @@ def cmd_submit(
     project_arg: Optional[str] = None,
     allow_warnings: bool = False,
     warning_reason: Optional[str] = None,
+    _qa_approved: bool = False,
+    _qa_record: Optional[dict] = None,
 ):
     """Validate and commit one batch as a recoverable transaction."""
     state = _load_state(project_arg)
     state_path = _project_state_path(state.get("project_id") or state["stem"])
 
+    if (
+        state.get("qa_required")
+        and state.get("qa_status") != "clean"
+        and not _qa_approved
+    ):
+        print("❌ 当前批次尚未完成 QA，不能直接 submit")
+        print("   请先完成翻译→校对→QA；有 finding 时由 qa-reviewer 复核后使用 qa-submit")
+        sys.exit(1)
+
     if not result_path.is_file():
         print(f"❌ 结果文件不存在: {result_path}")
         sys.exit(1)
+
+    if state.get("qa_required") and state.get("qa_status") == "clean" and not _qa_approved:
+        qa_baseline_hash = state.get("qa_input_sha256")
+        if not qa_baseline_hash or _sha256_file(result_path) != qa_baseline_hash:
+            print("❌ 提交文件不是 QA 通过的 reviewed 基线，请重新运行 QA")
+            sys.exit(1)
 
     # 读取 AI 结果
     with open(result_path, "r", encoding="utf-8") as f:
@@ -1036,6 +1132,26 @@ def cmd_submit(
                 _enrich_working_json(merged_file, state)
                 os.replace(merged_file, export_file)
 
+            qa_status = state.get("qa_status")
+            if state.get("qa_required") and qa_status in {"clean", "pending_agent"}:
+                audit = {
+                    "batch": state["current_batch"] + 1,
+                    "status": "agent_reviewed" if _qa_record else "clean",
+                    "finding_count": len((_qa_record or {}).get("findings", [])),
+                }
+                if _qa_record and _qa_record.get("_report_path"):
+                    audit["report_path"] = _qa_record["_report_path"]
+                state.setdefault("qa_history", []).append(audit)
+            state["qa_status"] = "not_started"
+            for key in (
+                "qa_batch",
+                "qa_input_sha256",
+                "qa_task_path",
+                "qa_reviewed_path",
+                "qa_report_path",
+                "qa_machine_findings",
+            ):
+                state.pop(key, None)
             state["current_batch"] += 1
             _save_state(state)
             completed = state["current_batch"] >= len(state["batches"])
@@ -1141,12 +1257,253 @@ def cmd_review(result_path: Path, project_arg: Optional[str] = None):
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(review, f, ensure_ascii=False, indent=2)
 
+    state["qa_status"] = "awaiting_review"
+    state["qa_batch"] = batch_num
+    state["qa_input_sha256"] = None
+    _save_state(state)
+
     print(f"📝 校对文件已生成: {out_path.name}")
     print(f"   共 {len(merged)} 条待校对")
     translated_count = sum(1 for e in merged if e["translated"])
     print(f"   其中 {translated_count} 条已有译文")
-    print(f"   校对后请将修正结果保存为 JSON，运行:")
-    print(f"   python batch_translate/batch.py submit <reviewed.json>")
+    reviewed_path = _current_reviewed_path(state)
+    print(f"   校对后请将修正结果保存为: {reviewed_path}")
+    print(f"   python batch_translate/batch.py qa --project {state['stem']}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# QA
+# ═══════════════════════════════════════════════════════════════════════
+
+def _current_reviewed_path(state: dict) -> Path:
+    batch_num = state["current_batch"] + 1
+    return _SCRIPT_DIR / "exports" / state["stem"] / f"_batch_{batch_num:03d}_reviewed.json"
+
+
+def _current_qa_task_path(state: dict) -> Path:
+    batch_num = state["current_batch"] + 1
+    return _SCRIPT_DIR / "exports" / state["stem"] / f"_batch_{batch_num:03d}_qa_task.json"
+
+
+def _current_qa_reviewed_path(state: dict) -> Path:
+    batch_num = state["current_batch"] + 1
+    return _SCRIPT_DIR / "exports" / state["stem"] / f"_batch_{batch_num:03d}_qa_reviewed.json"
+
+
+def _current_qa_report_path(state: dict) -> Path:
+    batch_num = state["current_batch"] + 1
+    return _SCRIPT_DIR / "exports" / state["stem"] / f"_batch_{batch_num:03d}_qa_report.json"
+
+
+def _load_json_file(path: Path, label: str) -> Any:
+    if not path.is_file():
+        print(f"❌ {label}不存在: {path}")
+        sys.exit(1)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as exc:
+        print(f"❌ {label} JSON 无效: {exc}")
+        sys.exit(1)
+
+
+def _current_batch_all_entries(state: dict, export_data: dict, results: list[dict]) -> list[dict]:
+    """Merge current reviewed targets into the full working-entry snapshot."""
+    result_map = {str(item["id"]): item["target"] for item in results}
+    start, end = state["batches"][state["current_batch"]]
+    all_entries = [dict(entry) for entry in export_data.get("entries", [])]
+    for entry in all_entries[start:end]:
+        if str(entry.get("id")) in result_map:
+            entry["target"] = result_map[str(entry["id"])]
+    return all_entries
+
+
+def cmd_qa(project_arg: Optional[str] = None):
+    """Run deterministic QA and prepare the QA-agent task for the current batch."""
+    state = _load_state(project_arg)
+    reviewed_path = _current_reviewed_path(state)
+    if state.get("qa_status") not in {"awaiting_review", "pending_agent", "clean"}:
+        print("❌ 当前批次尚未进入校对完成阶段，不能运行 QA")
+        sys.exit(1)
+    if state.get("qa_status") == "pending_agent" and _current_qa_task_path(state).is_file():
+        if _sha256_file(reviewed_path) == state.get("qa_input_sha256"):
+            print(f"ℹ️ 当前批次已有待处理 QA 任务: {_current_qa_task_path(state)}")
+            return
+        print("⚠️ reviewed 基线已变化，丢弃旧 QA 任务并重新运行 QA")
+
+    raw_results = _load_json_file(reviewed_path, "reviewed 文件")
+    results, warnings = _validate_submission(raw_results, state)
+    if warnings:
+        print("❌ reviewed 文件含 warning，QA 前必须先处理")
+        sys.exit(1)
+
+    export_data = _load_json_file(Path(state["export_file"]), "工作 JSON")
+    expected_entries = _load_expected_batch_entries(state, export_data)
+    try:
+        policy = state.get("qa_policy") or load_qa_policy(state.get("qa_policy_path"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"❌ QA 策略无效: {exc}")
+        sys.exit(1)
+
+    all_entries = _current_batch_all_entries(state, export_data, results)
+    qa_result = run_qa(results, expected_entries, policy, all_entries=all_entries)
+    batch_num = state["current_batch"] + 1
+    result_map = {str(item["id"]): item["target"] for item in results}
+    findings_by_id: dict[str, list[dict]] = {}
+    for finding in qa_result["findings"]:
+        findings_by_id.setdefault(str(finding["id"]), []).append(finding)
+
+    source_task = _SCRIPT_DIR / "exports" / state["stem"] / f"_batch_{batch_num:03d}_to_review.json"
+    source_task_data = _load_json_file(source_task, "校对任务") if source_task.is_file() else {}
+    qa_reviewed_path = _current_qa_reviewed_path(state)
+    qa_report_path = _current_qa_report_path(state)
+    task_entries = []
+    for entry in expected_entries:
+        item = dict(entry)
+        entry_id = str(item.get("id"))
+        item["target"] = result_map.get(entry_id, item.get("target", item.get("translated", "")))
+        item["findings"] = findings_by_id.get(entry_id, [])
+        item.pop("translated", None)
+        task_entries.append(item)
+    task = {
+        "schema_version": 1,
+        "mode": "qa",
+        "project": state["stem"],
+        "batch": batch_num,
+        "total_batches": state["total_batches"],
+        "instructions": (
+            "逐条查看 findings。确认是真问题时修正 target 并标记 fixed；"
+            "确认是误报时原样保留 target 并标记 false_positive。"
+            "必须处理全部 finding，严禁修改 locked 或 source_locked 条目。"
+        ),
+        "document_summary": source_task_data.get("document_summary", state.get("document_summary", "")),
+        "style_guide": source_task_data.get("style_guide", export_data.get("style_guide", "")),
+        "previous": source_task_data.get("previous"),
+        "policy": policy,
+        "qa_reviewed_path": str(qa_reviewed_path.resolve()),
+        "qa_report_path": str(qa_report_path.resolve()),
+        "entries": task_entries,
+        "findings": qa_result["findings"],
+        "summary": qa_result["summary"],
+    }
+    task_path = _current_qa_task_path(state)
+    _write_json_atomic(task_path, task)
+    state["qa_batch"] = batch_num
+    state["qa_input_sha256"] = _sha256_file(reviewed_path)
+    state["qa_task_path"] = str(task_path.resolve())
+    state["qa_reviewed_path"] = str(qa_reviewed_path.resolve())
+    state["qa_report_path"] = str(qa_report_path.resolve())
+    state["qa_machine_findings"] = qa_result["findings"]
+    state["qa_status"] = "clean" if not qa_result["findings"] else "pending_agent"
+    _save_state(state)
+    print(f"✅ QA 完成：{len(qa_result['findings'])} 个候选问题")
+    print(f"   任务: {task_path}")
+    if not qa_result["findings"]:
+        print("   未发现候选问题，可直接提交 reviewed JSON")
+    else:
+        print(f"   请启动 qa-reviewer，写入: {qa_reviewed_path}")
+        print(f"   QA 报告写入: {qa_report_path}")
+
+
+def cmd_qa_submit(
+    result_path: Path,
+    report_path: Path,
+    project_arg: Optional[str] = None,
+):
+    """Validate QA-agent decisions, then commit the corrected batch transactionally."""
+    state = _load_state(project_arg)
+    if state.get("qa_status") != "pending_agent":
+        print("❌ 当前批次没有待处理的 QA 任务")
+        sys.exit(1)
+    reviewed_path = _current_reviewed_path(state)
+    if _sha256_file(reviewed_path) != state.get("qa_input_sha256"):
+        print("❌ reviewed 基线在 QA 期间发生变化，请重新运行 QA")
+        sys.exit(1)
+
+    task = _load_json_file(_current_qa_task_path(state), "QA 任务")
+    if not isinstance(task, dict):
+        print("❌ QA 任务必须是 JSON 对象")
+        sys.exit(1)
+    expected_result_raw = task.get("qa_reviewed_path")
+    expected_report_raw = task.get("qa_report_path")
+    expected_result_path = (
+        Path(expected_result_raw) if isinstance(expected_result_raw, str) else None
+    )
+    expected_report_path = (
+        Path(expected_report_raw) if isinstance(expected_report_raw, str) else None
+    )
+    canonical_result_path = _current_qa_reviewed_path(state).resolve()
+    canonical_report_path = _current_qa_report_path(state).resolve()
+    if (
+        expected_result_path is None
+        or expected_report_path is None
+        or not expected_result_path.is_absolute()
+        or not expected_report_path.is_absolute()
+        or os.path.normcase(str(expected_result_path.resolve()))
+        != os.path.normcase(str(canonical_result_path))
+        or os.path.normcase(str(expected_report_path.resolve()))
+        != os.path.normcase(str(canonical_report_path))
+        or os.path.normcase(str(result_path.resolve()))
+        != os.path.normcase(str(expected_result_path.resolve()))
+        or os.path.normcase(str(report_path.resolve()))
+        != os.path.normcase(str(expected_report_path.resolve()))
+    ):
+        print("❌ QA 输出文件路径与 QA task 不一致，请按 task 中的绝对路径写入")
+        sys.exit(1)
+    report = _load_json_file(report_path, "QA 报告")
+    raw_baseline = _load_json_file(reviewed_path, "reviewed 文件")
+    baseline_results, baseline_warnings = _validate_submission(raw_baseline, state)
+    if baseline_warnings:
+        print("❌ reviewed 基线含 warning，不能提交 QA 结果")
+        sys.exit(1)
+    raw_results = _load_json_file(result_path, "QA reviewed 文件")
+    qa_results, qa_warnings = _validate_submission(raw_results, state)
+    if qa_warnings:
+        print("❌ QA reviewed 文件含 warning，不能提交")
+        sys.exit(1)
+
+    export_data = _load_json_file(Path(state["export_file"]), "工作 JSON")
+    expected_entries = _load_expected_batch_entries(state, export_data)
+    try:
+        policy = state.get("qa_policy") or load_qa_policy(state.get("qa_policy_path"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"❌ QA 策略无效: {exc}")
+        sys.exit(1)
+    report_errors = validate_qa_report(
+        report,
+        task.get("findings", []),
+        baseline_results,
+        qa_results,
+    )
+    all_entries = _current_batch_all_entries(state, export_data, qa_results)
+    recheck = run_qa(qa_results, expected_entries, policy, all_entries=all_entries)
+    false_positive_ids = {
+        str(item.get("finding_id"))
+        for item in report.get("findings", [])
+        if isinstance(item, dict) and item.get("status") == "false_positive"
+    }
+    remaining = [
+        finding["finding_id"]
+        for finding in recheck["findings"]
+        if finding["finding_id"] not in false_positive_ids
+    ]
+    if remaining:
+        report_errors.append(f"QA 修正后仍有未处理 finding: {sorted(remaining)}")
+    if report_errors:
+        print("❌ QA 报告校验失败:")
+        for error in report_errors:
+            print(f"   - {error}")
+        sys.exit(1)
+
+    cmd_submit(
+        result_path,
+        project_arg,
+        _qa_approved=True,
+        _qa_record={
+            **report,
+            "_report_path": str(report_path.resolve()),
+        },
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1578,6 +1935,10 @@ def main():
         help="项目验证策略 JSON 路径",
     )
     p_init.add_argument(
+        "--qa-policy", type=str, default=None,
+        help="项目 QA 策略 JSON 路径",
+    )
+    p_init.add_argument(
         "--resume",
         action="store_true",
         help="从带已有译文的 mqxliff 恢复初始化（状态已存在时不覆盖，直接 next 继续）",
@@ -1603,6 +1964,12 @@ def main():
     p_review = sub.add_parser("review", help="生成校对 JSON（翻译结果+原文对照）")
     p_review.add_argument("result", type=str, help="翻译结果 JSON 路径")
     add_project_argument(p_review)
+    p_qa = sub.add_parser("qa", help="运行程序化 QA 并生成 QA 代理任务")
+    add_project_argument(p_qa)
+    p_qa_submit = sub.add_parser("qa-submit", help="提交 QA 代理修正结果并推进")
+    p_qa_submit.add_argument("result", type=str, help="QA 修正后的完整 JSON 路径")
+    p_qa_submit.add_argument("--report", required=True, type=str, help="QA 判定报告 JSON 路径")
+    add_project_argument(p_qa_submit)
     p_submit = sub.add_parser("submit", help="提交校对结果并推进")
     p_submit.add_argument("result", type=str, help="校对后的结果 JSON 路径")
     add_project_argument(p_submit)
@@ -1661,6 +2028,7 @@ def main():
             terms_path=Path(args.terms) if args.terms else None,
             tm_path=Path(args.tm) if args.tm else None,
             style_guide_path=Path(args.style_guide) if args.style_guide else None,
+            qa_policy_path=Path(args.qa_policy) if args.qa_policy else None,
             source_col=args.source_col,
             target_col=args.target_col,
             header_row=args.header_row,
@@ -1676,6 +2044,10 @@ def main():
         cmd_next(review_only=args.review, project_arg=args.project)
     elif args.command == "review":
         cmd_review(Path(args.result), args.project)
+    elif args.command == "qa":
+        cmd_qa(args.project)
+    elif args.command == "qa-submit":
+        cmd_qa_submit(Path(args.result), Path(args.report), args.project)
     elif args.command == "submit":
         cmd_submit(
             Path(args.result),

@@ -1,6 +1,6 @@
 # batch-translate — 批量翻译工作流（Reasonix / Codex 通用工具包）
 
-配合 batch-translate Skill 使用的批量翻译工具，支持 Reasonix 与 Codex；日→中 翻译 + 校对 全自动循环。
+配合 batch-translate Skill 使用的批量翻译工具，支持 Reasonix 与 Codex；日→中 翻译 + 校对 + 程序化 QA 全自动循环。
 
 ## 支持格式
 
@@ -12,7 +12,7 @@ mqxliff（MemoQ） · docx · xlsx · xlsm · txt · csv/tsv（按整行处理�
 
 > "开始批量翻译"
 
-技能会自动完成：初始化 → 语境分析 → 翻译 → 校对 → 写回，全部自动化。
+技能会自动完成：初始化 → 语境分析 → 翻译 → 校对 → 程序化 QA → QA 复核 → 写回，全部自动化。
 
 ## 手动使用
 
@@ -26,7 +26,13 @@ python batch_translate/batch.py next
 # 3. 翻译后校对
 python batch_translate/batch.py review <翻译结果.json>
 
-# 4. 提交并推进到下一批
+# 4. 校对完成后先运行程序化 QA
+python batch_translate/batch.py qa --project <project-id>
+
+# 5. 有 finding 时由 qa-reviewer 写入两个 QA 文件后提交；无 finding 可直接提交校对结果
+python batch_translate/batch.py qa-submit <qa-reviewed.json> --report <qa-report.json> --project <project-id>
+
+# 无 finding 时直接提交并推进
 python batch_translate/batch.py submit <校对结果.json>
 
 # 其他
@@ -99,7 +105,7 @@ python -m pip install -r requirements.txt
 python batch_translate/batch.py version --json
 ```
 
-当前 workflow protocol 为 7。
+当前 workflow protocol 为 8。
 
 ## 测试
 
