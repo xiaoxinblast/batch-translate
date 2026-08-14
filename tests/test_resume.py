@@ -70,6 +70,13 @@ class InitResumeTest(unittest.TestCase):
         batch.cmd_init(self.src, resume=True)
         state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(state, {"marker": "keep-me"})
+        self.assertEqual(
+            batch._ACTIVE_PROJECT.read_text(encoding="utf-8"), self.STEM
+        )
+        self.assertEqual(
+            [path.name for path in (self.bt / "data").iterdir() if path.is_dir()],
+            [self.STEM],
+        )
 
 
 if __name__ == "__main__":

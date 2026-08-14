@@ -34,6 +34,13 @@ python batch_translate/batch.py status    # 查看进度
 python batch_translate/batch.py next --review  # 仅校对模式（已有译文）
 # 续跑/复跑：从带已有译文的 mqxliff 重新初始化（状态已存在则不覆盖，直接 next 继续）
 python batch_translate/batch.py init <已交付/xxx.mqxliff> --resume
+
+# 同名源文件或多项目并行时显式选择 project id
+python batch_translate/batch.py next --project <project-id>
+
+# 超大文件语境分析分片与报告合并任务
+python batch_translate/batch.py context-split --max-chars 60000 --project <project-id>
+python batch_translate/batch.py context-pack <part-report...> --project <project-id>
 ```
 
 ## 项目文件
@@ -43,8 +50,10 @@ python batch_translate/batch.py init <已交付/xxx.mqxliff> --resume
 | `data/style_guide.txt` | 翻译风格指南（共享） |
 | `data/term_base.xlsx` | 术语表：原文(ja) / 译文(zh) / 注释（共享） |
 | `data/tm_memory.json` | 翻译记忆（共享，自动积累） |
-| `data/<项目>/` | 工作文件和状态（自动生成） |
-| `exports/<项目>/` | 批次 JSON（自动生成） |
+| `data/<project-id>/` | 工作副本、身份记录和状态（同名源文件自动隔离） |
+| `exports/<project-id>/` | 批次 JSON、语境分片和完成清单 |
+
+用户指定的源文件始终只读；最终结果由 `export` 写入独立文件。DOCX 支持正文、所有表格单元格、嵌套表格、页眉和页脚，并使用位置 ID 防止清空段落后编号漂移；文本框会明确报告为未支持内容。
 
 ## 翻译记忆
 
@@ -82,7 +91,15 @@ python batch_translate/batch.py init <已交付/xxx.mqxliff> --resume
 python -m pip install -r requirements.txt
 ```
 
-内容：`lxml`、`openpyxl`、`python-docx`。脚本已内置 Windows UTF-8 输出处理，路径含中文/空格也可直接使用。
+要求 Python 3.10+。依赖使用兼容范围：`lxml>=5,<7`、`openpyxl>=3.1,<4`、`python-docx>=1.1,<2`。脚本已内置 Windows UTF-8 输出处理，路径含中文/空格也可直接使用。
+
+工具包版本契约：
+
+```bash
+python batch_translate/batch.py version --json
+```
+
+当前 workflow protocol 为 7。
 
 ## 测试
 

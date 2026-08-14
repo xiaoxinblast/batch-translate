@@ -51,16 +51,23 @@ class VerifyBatchTest(unittest.TestCase):
             json.dumps(state, ensure_ascii=False), encoding="utf-8"
         )
 
-    def _run(self, allow_warnings: bool = False) -> str:
+    def _run(
+        self,
+        allow_warnings: bool = False,
+        warning_reason: str | None = None,
+        expected_exit: int = 0,
+    ) -> str:
         sys.argv = ["verify_batch.py", "--stem", self.STEM] + (
             ["--allow-warnings"] if allow_warnings else []
         )
+        if warning_reason is not None:
+            sys.argv += ["--warning-reason", warning_reason]
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             try:
                 verify_batch.main()
             except SystemExit as e:
-                self.assertEqual(e.code, 0)
+                self.assertEqual(e.code, expected_exit)
         return out.getvalue()
 
     def test_project_policy_can_exempt_placeholder_tag_count(self):
@@ -113,8 +120,41 @@ class VerifyBatchTest(unittest.TestCase):
         }, ensure_ascii=False), encoding="utf-8")
         self._write_state(1)
 
-        out = self._run(allow_warnings=True)
+        out = self._run(
+            allow_warnings=True,
+            warning_reason="项目允许对象包装",
+        )
         self.assertIn("PASS (warnings accepted", out)
+
+    def test_warnings_fail_without_explicit_acceptance(self):
+        entries = [{"id": "1", "source": "あ"}]
+        self.export_file.write_text(
+            json.dumps({"entries": entries}, ensure_ascii=False), encoding="utf-8"
+        )
+        self.reviewed.write_text(
+            json.dumps({"entries": [{"id": "1", "target": "译文"}]}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self._write_state(1)
+
+        out = self._run(expected_exit=3)
+
+        self.assertIn("RESULT: BLOCKED", out)
+
+    def test_allow_warnings_requires_reason(self):
+        entries = [{"id": "1", "source": "あ"}]
+        self.export_file.write_text(
+            json.dumps({"entries": entries}, ensure_ascii=False), encoding="utf-8"
+        )
+        self.reviewed.write_text(
+            json.dumps({"entries": [{"id": "1", "target": "译文"}]}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self._write_state(1)
+
+        out = self._run(allow_warnings=True, expected_exit=2)
+
+        self.assertIn("warning-reason", out)
 
     def test_missing_id_is_fatal(self):
         """条数缺失仍为 FATAL，--allow-warnings 不能放行。"""

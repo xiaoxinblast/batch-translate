@@ -175,7 +175,8 @@ class BatchWorkflowTest(unittest.TestCase):
             .read_text(encoding="utf-8")
         )
         translated = task["entries"][0]["source"].replace("原文", "译文")
-        batch.cmd_submit(self._write_result("formatted", 1, {"1": translated}))
+        entry_id = task["entries"][0]["id"]
+        batch.cmd_submit(self._write_result("formatted", 1, {entry_id: translated}))
 
         delivered = self.base / "formatted_translated.docx"
         batch.cmd_export("formatted", str(delivered), False)
@@ -202,6 +203,41 @@ class BatchWorkflowTest(unittest.TestCase):
         batch.cmd_export("locked", str(delivered), False)
         self.assertEqual(source.read_bytes(), original)
         self.assertTrue(delivered.is_file())
+
+    def test_policy_allowed_empty_clears_unlocked_mqxliff_target(self):
+        source = self.base / "clear.mqxliff"
+        source.write_text(
+            _MINI_MQ.replace(
+                '<target xml:space="preserve"></target>',
+                '<target xml:space="preserve">旧译文</target>',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        policy = self.base / "allow-empty.json"
+        policy.write_text(
+            json.dumps({"allow_empty_ids": ["1"]}), encoding="utf-8"
+        )
+        batch.cmd_init(source, validation_policy_path=policy)
+        batch.cmd_next(review_only=True)
+        result = self.base / "clear-result.json"
+        result.write_text(
+            json.dumps([
+                {"id": "1", "target": ""},
+                {"id": "2", "target": "译文二"},
+            ], ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        batch.cmd_submit(result)
+        delivered = self.base / "clear-delivered.mqxliff"
+        batch.cmd_export("clear", str(delivered), False)
+
+        from mqxliff_tool import parse_mqxliff
+
+        units, _ = parse_mqxliff(delivered)
+        self.assertEqual(next(unit for unit in units if unit.id == "1").target_text, "")
+        self.assertEqual(next(unit for unit in units if unit.id == "2").target_text, "译文二")
 
     def test_out_of_batch_id_is_rejected_without_file_changes(self):
         source = self.base / "ids.txt"
@@ -236,6 +272,129 @@ class BatchWorkflowTest(unittest.TestCase):
             batch.cmd_init(source, validation_policy_path=policy)
         self.assertFalse((self.tool / "data" / "policy").exists())
         self.assertFalse(batch._ACTIVE_PROJECT.exists())
+
+    def test_effective_validation_policy_is_injected_into_tasks(self):
+        source = self.base / "policy.txt"
+        source.write_text("原文\n", encoding="utf-8")
+        policy = self.base / "validation_policy.json"
+        policy.write_text(
+            json.dumps({
+                "ignored_tag_types": [],
+                "allow_empty_ids": ["1"],
+                "entry_overrides": {
+                    "1": {
+                        "tag_mode": "ignore",
+                        "enforce_newline_count": True,
+                    }
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        batch.cmd_init(source, validation_policy_path=policy)
+        batch.cmd_next()
+        task = json.loads(
+            (self.tool / "exports" / "policy" / "_batch_001_to_translate.json")
+            .read_text(encoding="utf-8")
+        )
+
+        validation = task["entries"][0]["validation"]
+        self.assertEqual(validation["ignored_tag_types"], [])
+        self.assertEqual(validation["tag_mode"], "ignore")
+        self.assertTrue(validation["enforce_newline_count"])
+        self.assertTrue(validation["allow_empty"])
+
+    def test_submit_warnings_require_reason_and_are_recorded(self):
+        source = self.base / "warnings.txt"
+        source.write_text("原文\n", encoding="utf-8")
+        batch.cmd_init(source)
+        batch.cmd_next()
+        wrapped = self.base / "wrapped.json"
+        wrapped.write_text(
+            json.dumps({"entries": [{"id": "1", "target": "译文"}]}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(SystemExit):
+            batch.cmd_submit(wrapped)
+        with self.assertRaises(SystemExit):
+            batch.cmd_submit(wrapped, allow_warnings=True)
+
+        batch.cmd_submit(
+            wrapped,
+            allow_warnings=True,
+            warning_reason="项目接受对象包装",
+        )
+
+        manifest = json.loads(
+            (self.tool / "exports" / "warnings" / "project_manifest.json")
+            .read_text(encoding="utf-8")
+        )
+        acceptance = manifest["warning_acceptances"][0]
+        self.assertEqual(acceptance["batch"], 1)
+        self.assertEqual(acceptance["reason"], "项目接受对象包装")
+        self.assertTrue(acceptance["warnings"])
+
+    def test_same_stem_sources_use_distinct_project_ids(self):
+        first_dir = self.base / "project_a"
+        second_dir = self.base / "project_b"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        first = first_dir / "dialogue.txt"
+        second = second_dir / "dialogue.txt"
+        first.write_text("一\n", encoding="utf-8")
+        second.write_text("二\n", encoding="utf-8")
+
+        first_project = batch.cmd_init(first)
+        second_project = batch.cmd_init(second)
+
+        self.assertEqual(first_project, "dialogue")
+        self.assertNotEqual(second_project, first_project)
+        self.assertTrue(second_project.startswith("dialogue-"))
+        first_state = self._state(first_project)
+        second_state = self._state(second_project)
+        self.assertEqual(Path(first_state["input_source_file"]), first.resolve())
+        self.assertEqual(Path(second_state["input_source_file"]), second.resolve())
+        self.assertEqual(
+            batch._ACTIVE_PROJECT.read_text(encoding="utf-8"), second_project
+        )
+
+    def test_context_split_and_pack_cover_all_entries(self):
+        source = self.base / "large.txt"
+        source.write_text("一一\n二二\n三三\n", encoding="utf-8")
+        batch.cmd_init(source)
+
+        manifest_path = batch.cmd_context_split(3, "large")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["total_parts"], 3)
+        part_entries = []
+        report_paths = []
+        for part in manifest["parts"]:
+            payload = json.loads(Path(part["path"]).read_text(encoding="utf-8"))
+            part_entries.extend(entry["id"] for entry in payload["entries"])
+            report = self.base / f"part_{part['part']}.md"
+            report.write_text(f"分片 {part['part']} 报告", encoding="utf-8")
+            report_paths.append(report)
+        self.assertEqual(part_entries, ["1", "2", "3"])
+
+        merge_path = batch.cmd_context_pack(report_paths, None, "large")
+        merge = json.loads(merge_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(merge["mode"], "context_merge")
+        self.assertEqual(len(merge["part_reports"]), 3)
+
+    def test_init_refuses_to_overwrite_existing_state(self):
+        source = self.base / "existing.txt"
+        source.write_text("一\n", encoding="utf-8")
+        project_id = batch.cmd_init(source)
+        state_path = self.tool / "data" / project_id / "batch_state.json"
+        before = state_path.read_bytes()
+
+        with self.assertRaises(SystemExit):
+            batch.cmd_init(source)
+
+        self.assertEqual(state_path.read_bytes(), before)
 
     def test_mqxliff_failure_rolls_back_work_json_tm_and_state(self):
         source = self.base / "rollback.mqxliff"

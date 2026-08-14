@@ -128,7 +128,6 @@ def validate_batch_results(
     if extra_ids:
         result.fatal.append(f"包含批外 id: {sorted(extra_ids)[:20]}")
 
-    allow_empty_ids = {str(v) for v in policy.get("allow_empty_ids", [])}
     for expected in expected_entries:
         entry_id = str(expected["id"])
         submitted_item = submitted.get(entry_id)
@@ -137,17 +136,15 @@ def validate_batch_results(
         target = submitted_item["target"]
         source = expected.get("source") or ""
         baseline = expected.get("translated", expected.get("target", "")) or ""
-        entry_policy = _entry_policy(policy, entry_id)
+        entry_policy = effective_entry_policy(policy, entry_id)
         locked = bool(expected.get("locked"))
         source_locked = bool(expected.get("source_locked"))
 
         if locked and target != baseline:
             result.fatal.append(f"id={entry_id} 为 locked，target 被修改")
 
-        allow_empty = (
-            entry_id in allow_empty_ids
-            or bool(entry_policy.get("allow_empty"))
-            or (source_locked and baseline == "")
+        allow_empty = bool(entry_policy.get("allow_empty")) or (
+            source_locked and baseline == ""
         )
         if not target.strip() and not allow_empty:
             result.fatal.append(f"id={entry_id} 的 target 为空")
@@ -203,13 +200,19 @@ def _extract_tags(text: str) -> tuple[list[tuple[str, str, str]], bool]:
     return tags, "<tag" in remainder
 
 
-def _entry_policy(policy: dict[str, Any], entry_id: str) -> dict[str, Any]:
+def effective_entry_policy(
+    policy: dict[str, Any], entry_id: str | int
+) -> dict[str, Any]:
+    """Return the fully resolved validation contract for one entry."""
+    entry_id = str(entry_id)
     merged = {
         "ignored_tag_types": list(policy.get("ignored_tag_types", [])),
         "tag_mode": policy.get("tag_mode", "exact"),
         "enforce_maxlength": bool(policy.get("enforce_maxlength", True)),
         "enforce_newline_count": bool(policy.get("enforce_newline_count", False)),
-        "allow_empty": False,
+        "allow_empty": entry_id in {
+            str(value) for value in policy.get("allow_empty_ids", [])
+        },
     }
     override = policy.get("entry_overrides", {}).get(entry_id, {})
     merged.update(override)

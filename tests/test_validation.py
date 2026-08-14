@@ -9,7 +9,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from validation import load_validation_policy, validate_batch_results
+from validation import (
+    effective_entry_policy,
+    load_validation_policy,
+    validate_batch_results,
+)
 
 
 class ValidationTest(unittest.TestCase):
@@ -78,6 +82,19 @@ class ValidationTest(unittest.TestCase):
         )
         self.assertTrue(any("id=1" in message for message in report.fatal))
         self.assertFalse(any("id=2" in message for message in report.fatal))
+
+    def test_effective_entry_policy_includes_global_empty_allowance(self):
+        policy = load_validation_policy()
+        policy["allow_empty_ids"] = ["2"]
+        policy["entry_overrides"] = {
+            "2": {"tag_mode": "ignore", "enforce_newline_count": True}
+        }
+
+        effective = effective_entry_policy(policy, "2")
+
+        self.assertTrue(effective["allow_empty"])
+        self.assertEqual(effective["tag_mode"], "ignore")
+        self.assertTrue(effective["enforce_newline_count"])
 
     def test_maxlength_is_enforced(self):
         expected = [{"id": "1", "source": "原文", "maxlengthchars": "3"}]

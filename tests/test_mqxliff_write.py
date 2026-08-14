@@ -55,6 +55,24 @@ class MqxliffWriteTest(unittest.TestCase):
         self.assertIn("MATERIA&amp;EQUIPMENT", raw)
         self.assertNotIn("&lt;ph ", raw)
 
+    def test_explicit_empty_target_clears_existing_translation(self):
+        src = self.td / "existing.mqxliff"
+        src.write_text(
+            _fixture_xml().replace(
+                '<target xml:space="preserve"></target>',
+                '<target xml:space="preserve">旧译文</target>',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        units, tree = mt.parse_mqxliff(src)
+        out = self.td / "cleared.mqxliff"
+
+        mt.write_translations(tree, units, {"1": ""}, output_path=out)
+
+        written, _ = mt.parse_mqxliff(out)
+        self.assertEqual(next(unit for unit in written if unit.id == "1").target_text, "")
+
     def test_bare_actor_tag_normalized(self):
         """裸 <actor> 会被归一化为源文件的 ph 元素并保留。"""
         tr = {"2": "<actor>"}

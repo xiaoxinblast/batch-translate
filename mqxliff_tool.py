@@ -590,7 +590,7 @@ def write_translations(
 
         tu = tu_by_id.get(tu_id)
         target_text = translations[tu_id]
-        if target_text is None or (isinstance(target_text, str) and not target_text.strip()):
+        if not isinstance(target_text, str):
             continue
 
         # 跳过锁定句段：mq:locked="locked" 或 translate="no"
@@ -855,32 +855,27 @@ def import_from_json(
     translations = {}
     tm_new_entries = []
     for entry in entries:
-        target = entry.get("target", "")
-        if target and target.strip():
-            translations[entry["id"]] = target
-            # 积累 TM 条目（保留完整 tag 标记）
-            if tm_path:
-                source_tagged = entry.get("source", "").strip()
-                if not source_tagged:
-                    continue
-                # 验证：如果去掉 tag 后纯文本为空，跳过
-                if not _tag_strip_re.sub("", source_tagged).strip():
-                    continue
-                tm_new_entries.append({
-                    "_id": str(entry["id"]),
-                    "source": source_tagged,
-                    "target": target.strip(),
-                    "context": entry.get("context", ""),
-                    "file": source_file_name,
-                })
+        if "target" not in entry or not isinstance(entry["target"], str):
+            continue
+        target = entry["target"]
+        translations[entry["id"]] = target
+        # 空 target 是显式清空，不进入 TM。
+        if tm_path and target.strip():
+            source_tagged = entry.get("source", "").strip()
+            if not source_tagged:
+                continue
+            if not _tag_strip_re.sub("", source_tagged).strip():
+                continue
+            tm_new_entries.append({
+                "_id": str(entry["id"]),
+                "source": source_tagged,
+                "target": target.strip(),
+                "context": entry.get("context", ""),
+                "file": source_file_name,
+            })
 
-    has_untranslated = any(
-        not str(entry.get("target", "") or "").strip()
-        and str(entry.get("id")) not in locked_ids
-        for entry in entries
-    )
-    if not translations and (has_untranslated or not entries):
-        print("❌ JSON 中没有任何 target 翻译内容。")
+    if not translations:
+        print("❌ JSON 中没有任何字符串 target 字段。")
         sys.exit(1)
 
     print(f"📥 从 JSON 读取到 {len(translations)} 条翻译")

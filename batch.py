@@ -8,6 +8,7 @@
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -17,7 +18,12 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from validation import load_validation_policy, validate_batch_results
+from validation import (
+    effective_entry_policy,
+    load_validation_policy,
+    validate_batch_results,
+)
+from toolkit_version import TOOLKIT_VERSION, WORKFLOW_PROTOCOL_VERSION
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -27,37 +33,151 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 # 保留这些作为 fallback（init 前尚未有 stem 时）
 _DEFAULT_EXPORT = _SCRIPT_DIR / "exports" / "_working.json"
 _ACTIVE_PROJECT = _SCRIPT_DIR / "data" / ".active_project"
+_INVALID_PROJECT_ID = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
-def _get_state_path() -> Path:
-    """从 .active_project 读取当前 stem，返回 state 文件路径。"""
+def _validate_project_id(project_id: str) -> str:
+    project_id = str(project_id).strip()
+    if (
+        not project_id
+        or project_id in {".", ".."}
+        or project_id.endswith((" ", "."))
+        or _INVALID_PROJECT_ID.search(project_id)
+    ):
+        raise ValueError(f"无效的 project id: {project_id!r}")
+    return project_id
+
+
+def _project_state_path(project_id: str) -> Path:
+    return _SCRIPT_DIR / "data" / project_id / "batch_state.json"
+
+
+def _project_identity_path(project_id: str) -> Path:
+    return _SCRIPT_DIR / "data" / project_id / "project_identity.json"
+
+
+def _resolve_project_id(project_arg: Optional[str] = None) -> str:
+    """返回显式 project id，或 data/.active_project 中的当前项目。"""
+    if project_arg:
+        try:
+            return _validate_project_id(project_arg)
+        except ValueError as exc:
+            print(f"❌ {exc}")
+            sys.exit(1)
     if _ACTIVE_PROJECT.is_file():
-        stem = _ACTIVE_PROJECT.read_text(encoding="utf-8").strip()
-        return _SCRIPT_DIR / "data" / stem / "batch_state.json"
+        project_id = _ACTIVE_PROJECT.read_text(encoding="utf-8").strip()
+        if project_id:
+            try:
+                return _validate_project_id(project_id)
+            except ValueError as exc:
+                print(f"❌ {exc}")
+                sys.exit(1)
+    print("❌ 未指定 --project 且 data/.active_project 不可用")
+    sys.exit(1)
+
+
+def _get_state_path(project_arg: Optional[str] = None) -> Path:
+    """返回指定项目或当前活动项目的 state 文件路径。"""
+    if project_arg or _ACTIVE_PROJECT.is_file():
+        return _project_state_path(_resolve_project_id(project_arg))
     # fallback: 旧格式（单文件平铺在 data/ 下）
     return _SCRIPT_DIR / "data" / "batch_state.json"
 
 
-def _set_active_stem(stem: str):
-    """设置当前活动的项目 stem。"""
+def _set_active_project(project_id: str):
+    """设置当前活动的 project id。"""
     _ACTIVE_PROJECT.parent.mkdir(parents=True, exist_ok=True)
-    _ACTIVE_PROJECT.write_text(stem, encoding="utf-8")
+    _ACTIVE_PROJECT.write_text(_validate_project_id(project_id), encoding="utf-8")
+
+
+def _set_active_stem(stem: str):
+    """Backward-compatible alias for older callers."""
+    _set_active_project(stem)
 
 
 def _resolve_stem(stem_arg: Optional[str]) -> str:
-    """返回 --stem 参数或 .active_project 中的 stem。"""
-    if stem_arg:
-        return stem_arg
-    if _ACTIVE_PROJECT.is_file():
-        stem = _ACTIVE_PROJECT.read_text(encoding="utf-8").strip()
-        if stem:
-            return stem
-    print("❌ 未指定 --stem 且 data/.active_project 不可用")
-    sys.exit(1)
+    """Backward-compatible alias for project-id resolution."""
+    return _resolve_project_id(stem_arg)
 
 
-def _load_state() -> dict:
-    state_path = _get_state_path()
+def _normalize_source_path(path: str | Path) -> str:
+    return os.path.normcase(str(Path(path).resolve()))
+
+
+def _read_project_record(project_id: str) -> dict:
+    paths = (
+        _project_identity_path(project_id),
+        _project_state_path(project_id),
+        _SCRIPT_DIR / "exports" / project_id / "project_manifest.json",
+    )
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                record = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(record, dict):
+            return record
+    return {}
+
+
+def _project_occupied(project_id: str) -> bool:
+    for path in (
+        _SCRIPT_DIR / "data" / project_id,
+        _SCRIPT_DIR / "exports" / project_id,
+    ):
+        if path.is_file():
+            return True
+        if path.is_dir() and any(path.iterdir()):
+            return True
+    return False
+
+
+def _record_matches_source(record: dict, source_path: Path) -> bool:
+    recorded = record.get("input_source_file")
+    if not recorded:
+        return False
+    return _normalize_source_path(recorded) == _normalize_source_path(source_path)
+
+
+def _choose_project_id(
+    source_path: Path,
+    requested: Optional[str] = None,
+    allow_legacy_resume: bool = False,
+) -> str:
+    """Choose a stable directory id without colliding on filename stem."""
+    if requested:
+        return _validate_project_id(requested)
+
+    base = _validate_project_id(source_path.stem)
+    if not _project_occupied(base):
+        return base
+    base_record = _read_project_record(base)
+    if _record_matches_source(base_record, source_path):
+        return base
+    if (
+        allow_legacy_resume
+        and _project_state_path(base).is_file()
+        and not base_record.get("input_source_file")
+    ):
+        return base
+
+    digest = hashlib.sha256(
+        _normalize_source_path(source_path).encode("utf-8")
+    ).hexdigest()
+    for length in (8, 12, 16, 64):
+        candidate = _validate_project_id(f"{base}-{digest[:length]}")
+        if not _project_occupied(candidate):
+            return candidate
+        if _record_matches_source(_read_project_record(candidate), source_path):
+            return candidate
+    raise ValueError(f"无法为源文件生成唯一 project id: {source_path}")
+
+
+def _load_state(project_arg: Optional[str] = None) -> dict:
+    state_path = _get_state_path(project_arg)
     if not state_path.is_file():
         print("❌ 未初始化，请先运行 init")
         sys.exit(1)
@@ -66,7 +186,8 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict):
-    state_path = _get_state_path()
+    project_id = state.get("project_id") or state.get("stem")
+    state_path = _project_state_path(_validate_project_id(project_id))
     _write_json_atomic(state_path, state)
 
 
@@ -267,7 +388,7 @@ def _build_review_json(
         "3)语气是否符合角色 4)表达是否自然流畅、无翻译腔。"
         + (
             "每条 entry 可能带有 tm_matches（翻译记忆参考）、tm_fragments（片段匹配参考）和 terms（术语约束），核对时参考。"
-            "内联标签（<tag .../>）必须原样保留，数量与位置与 source 一致——丢失标签是最严重的错误。"
+            "每条 entry 的 validation 是该条最终生效的校验规则，标签、长度、换行和空译文均以该对象为准。"
         )
         + ("发现问题直接修正，无需标注。" if review_only else "")
     )
@@ -310,6 +431,8 @@ def _build_review_json(
             item["tm_matches"] = e["tm_matches"]
         if e.get("tm_fragments"):
             item["tm_fragments"] = e["tm_fragments"]
+        if isinstance(e.get("validation"), dict):
+            item["validation"] = e["validation"]
         review_entries.append(item)
     review["entries"] = review_entries
     return review
@@ -332,29 +455,56 @@ def cmd_init(
     sheet_name: Optional[str] = None,
     validation_policy_path: Optional[Path] = None,
     resume: bool = False,
-):
+    project_id: Optional[str] = None,
+    force_reinit: bool = False,
+) -> str:
     """初始化批量翻译：解析源文件 → 中间 JSON，写入 state。"""
     source_path = source_path.resolve()
     if not source_path.is_file():
         print(f"❌ 源文件不存在: {source_path}")
         sys.exit(1)
-    if validation_policy_path:
-        try:
-            load_validation_policy(validation_policy_path)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            print(f"❌ 验证策略无效: {exc}")
-            sys.exit(1)
+    try:
+        validation_policy = load_validation_policy(validation_policy_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"❌ 验证策略无效: {exc}")
+        sys.exit(1)
 
-    stem = source_path.stem  # 不含扩展名的文件名，用作目录名
-    _set_active_stem(stem)
-
-    state_path = _get_state_path()
+    try:
+        project_id = _choose_project_id(
+            source_path, project_id, allow_legacy_resume=resume
+        )
+    except ValueError as exc:
+        print(f"❌ {exc}")
+        sys.exit(1)
+    stem = project_id
+    state_path = _project_state_path(project_id)
     if state_path.is_file():
         if resume:
+            _set_active_project(project_id)
             print("ℹ️ 状态文件已存在，无需重新初始化。直接运行 next 继续。")
-            return
-        print("⚠️ 状态文件已存在，将覆盖。")
-        print("  如需继续之前的任务，请直接运行 next")
+            return project_id
+        if not force_reinit:
+            print(f"❌ 项目状态已存在，拒绝覆盖: {state_path}")
+            print("   继续现有任务请运行 next；重新初始化请显式使用 --force-reinit")
+            sys.exit(1)
+
+    existing_record = _read_project_record(project_id)
+    if (
+        existing_record
+        and not _record_matches_source(existing_record, source_path)
+        and not (resume or force_reinit)
+    ):
+        print(f"❌ project id 已属于其他源文件: {project_id}")
+        print("   请改用其他 --project，或确认后使用 --force-reinit")
+        sys.exit(1)
+
+    identity = {
+        "project_id": project_id,
+        "source_stem": source_path.stem,
+        "original_source_name": source_path.name,
+        "input_source_file": str(source_path.resolve()),
+    }
+    _write_json_atomic(_project_identity_path(project_id), identity)
 
     # 复制源文件到工作文件（不动源文件）
     import shutil
@@ -422,7 +572,9 @@ def cmd_init(
     document_summary = _generate_summary(entries, batches, batch_chars)
 
     state = {
+        "project_id": project_id,
         "stem": stem,
+        "source_stem": source_path.stem,
         "original_source_name": source_path.name,
         "input_source_file": str(source_path.resolve()),
         "source_file": str(work_file.resolve()),
@@ -441,6 +593,7 @@ def cmd_init(
         "validation_policy_path": (
             str(validation_policy_path.resolve()) if validation_policy_path else None
         ),
+        "validation_policy": validation_policy,
         "source_col": source_col,
         "target_col": target_col,
         "header_row": header_row,
@@ -454,16 +607,24 @@ def cmd_init(
     # 检测混合文件（部分条目有译文、部分无）
     with open(export_file, "r", encoding="utf-8") as f:
         enriched = json.load(f)
+    parser_warnings = [
+        str(message) for message in enriched.get("warnings", []) if message
+    ]
     existing_targets = sum(1 for e in enriched["entries"] if e.get("target") and e["target"].strip())
     state["existing_targets"] = existing_targets
+    state["parser_warnings"] = parser_warnings
     _save_state(state)
+    _set_active_project(project_id)
 
     # 显示分批信息
     avg = sum(e - s for s, e in batches) / total_batches
     print(f"✅ 初始化完成")
+    print(f"   Project: {project_id}")
     print(f"   文件: {export_file.name}")
     print(f"   总数: {total} 条, 每批 ~{batch_chars} 字, 共 {total_batches} 批（平均 ~{avg:.0f} 条/批）")
     print(f"   上下文窗口: {context_size} 条")
+    for warning in parser_warnings:
+        print(f"   ⚠️ 解析警告: {warning}")
     if 0 < existing_targets < total:
         print(f"   🔀 混合文件: {existing_targets}/{total} 条已有译文（translate 模式将自动锁定已有译文）")
     elif existing_targets == total:
@@ -473,17 +634,18 @@ def cmd_init(
     print()
     print("运行 next 获取第一批翻译任务。")
     if resume:
-        print("ℹ️ --resume 模式：已有译文将自动锁定；若 exports/<stem>/document_summary.md")
+        print("ℹ️ --resume 模式：已有译文将自动锁定；若 exports/<project-id>/document_summary.md")
         print("   已存在，可跳过语境分析直接进入循环。")
+    return project_id
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # next
 # ═══════════════════════════════════════════════════════════════════════
 
-def cmd_next(review_only: bool = False):
+def cmd_next(review_only: bool = False, project_arg: Optional[str] = None):
     """输出当前批次的翻译 JSON（或校对 JSON，若 review_only=True）。"""
-    state = _load_state()
+    state = _load_state(project_arg)
 
     # 检查是否已完成
     batch_idx = state["current_batch"]
@@ -499,6 +661,14 @@ def cmd_next(review_only: bool = False):
         sys.exit(1)
     with open(export_file, "r", encoding="utf-8") as f:
         data = json.load(f)
+
+    try:
+        validation_policy = state.get("validation_policy") or load_validation_policy(
+            state.get("validation_policy_path")
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"❌ 验证策略无效: {exc}")
+        sys.exit(1)
 
     entries = data["entries"]
     total = state["total"]
@@ -521,8 +691,17 @@ def cmd_next(review_only: bool = False):
 
     if review_only:
         # ── 校对模式：直接生成 review JSON（跳过翻译） ──
+        review_source_entries = [
+            {
+                **entry,
+                "validation": effective_entry_policy(
+                    validation_policy, entry["id"]
+                ),
+            }
+            for entry in entries[start:end]
+        ]
         review = _build_review_json(
-            entries[start:end],
+            review_source_entries,
             state,
             style_guide=data.get("style_guide", ""),
             previous=context_entries or None,
@@ -566,6 +745,9 @@ def cmd_next(review_only: bool = False):
             item["tm_matches"] = e["tm_matches"]
         if e.get("tm_fragments"):
             item["tm_fragments"] = e["tm_fragments"]
+        item["validation"] = effective_entry_policy(
+            validation_policy, e["id"]
+        )
         if e.get("maxlengthchars"):
             item["maxlengthchars"] = e["maxlengthchars"]
         if e.get("source_locked"):
@@ -612,7 +794,7 @@ def cmd_next(review_only: bool = False):
         "不要猜测，应主动搜索项目文件或联网搜索以获取准确信息后，再给出确定译文。"
         "每条 entry 可能带有 tm_matches（翻译记忆模糊匹配，高相似度可直接复用）"
         "和 terms（术语库匹配），翻译时优先参考。"
-        "原文中的 <tag .../> 内联标签必须原样保留在译文中，数量和位置不变。"
+        "每条 entry 的 validation 是该条最终生效的校验规则，标签、长度、换行和空译文均以该对象为准。"
         "最终返回结果必须是干净的译文，不要附加任何标注或说明。"
         + ("\n\n" + instr if instr else "")
     )
@@ -674,14 +856,21 @@ def _load_expected_batch_entries(state: dict, export_data: dict) -> list[dict]:
     return expected
 
 
-def _validate_submission(results, state: dict) -> list[dict]:
+def _validate_submission(
+    results,
+    state: dict,
+    allow_warnings: bool = False,
+    warning_reason: Optional[str] = None,
+) -> tuple[list[dict], list[str]]:
     """Run the same strict validation used by Step 4.5."""
     export_file = Path(state["export_file"])
     with open(export_file, "r", encoding="utf-8") as f:
         export_data = json.load(f)
     expected_entries = _load_expected_batch_entries(state, export_data)
     try:
-        policy = load_validation_policy(state.get("validation_policy_path"))
+        policy = state.get("validation_policy") or load_validation_policy(
+            state.get("validation_policy_path")
+        )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"❌ 验证策略无效: {exc}")
         sys.exit(1)
@@ -692,16 +881,28 @@ def _validate_submission(results, state: dict) -> list[dict]:
         for message in report.fatal:
             print(f"   - {message}")
         sys.exit(1)
-    for warning in report.warnings:
-        print(f"⚠️ {warning}")
+    if report.warnings:
+        for warning in report.warnings:
+            print(f"⚠️ {warning}")
+        if not allow_warnings:
+            print("❌ 提交包含 warning；修正后重试，或显式使用 --allow-warnings --warning-reason <原因>")
+            sys.exit(1)
+        if not str(warning_reason or "").strip():
+            print("❌ --allow-warnings 必须同时提供非空 --warning-reason")
+            sys.exit(1)
     print(f"✅ 提交校验通过：{len(report.entries)} 条")
-    return report.entries
+    return report.entries, report.warnings
 
 
-def cmd_submit(result_path: Path):
+def cmd_submit(
+    result_path: Path,
+    project_arg: Optional[str] = None,
+    allow_warnings: bool = False,
+    warning_reason: Optional[str] = None,
+):
     """Validate and commit one batch as a recoverable transaction."""
-    state = _load_state()
-    state_path = _get_state_path()
+    state = _load_state(project_arg)
+    state_path = _project_state_path(state.get("project_id") or state["stem"])
 
     if not result_path.is_file():
         print(f"❌ 结果文件不存在: {result_path}")
@@ -731,7 +932,18 @@ def cmd_submit(result_path: Path):
             sys.exit(1)
 
     # 与 Step 4.5 共用同一校验器；返回已规范化的扁平数组。
-    results = _validate_submission(results, state)
+    results, warnings = _validate_submission(
+        results,
+        state,
+        allow_warnings=allow_warnings,
+        warning_reason=warning_reason,
+    )
+    if warnings:
+        state.setdefault("warning_acceptances", []).append({
+            "batch": state["current_batch"] + 1,
+            "reason": str(warning_reason).strip(),
+            "warnings": list(warnings),
+        })
 
     result_map = {str(r["id"]): r["target"] for r in results}
     print(f"📥 读取到 {len(result_map)} 条翻译")
@@ -782,11 +994,20 @@ def cmd_submit(result_path: Path):
         try:
             if state["source_format"] == "mqxliff":
                 candidate_work = temp_dir / f"candidate{work_file.suffix}"
+                submitted_file = temp_dir / "submitted.json"
+                submitted_data = {
+                    key: value for key, value in data.items() if key != "entries"
+                }
+                submitted_data["entries"] = [
+                    entry for entry in data["entries"]
+                    if entry["id"] in result_map
+                ]
+                _write_json_atomic(submitted_file, submitted_data)
                 import_args = [
                     sys.executable,
                     str(_SCRIPT_DIR / "mqxliff_tool.py"),
                     "import",
-                    str(merged_file),
+                    str(submitted_file),
                     str(work_file),
                     "--output",
                     str(candidate_work),
@@ -868,16 +1089,19 @@ def cmd_submit(result_path: Path):
 
     # 自动输出下一批（review 全译文模式继续走校对）
     print()
-    cmd_next(review_only=(state.get("existing_targets") == state["total"]))
+    cmd_next(
+        review_only=(state.get("existing_targets") == state["total"]),
+        project_arg=state.get("project_id") or state["stem"],
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # review
 # ═══════════════════════════════════════════════════════════════════════
 
-def cmd_review(result_path: Path):
+def cmd_review(result_path: Path, project_arg: Optional[str] = None):
     """将翻译结果与原文合并，生成校对 JSON。"""
-    state = _load_state()
+    state = _load_state(project_arg)
 
     # 读取当前批的翻译任务 JSON
     batch_num = state["current_batch"] + 1
@@ -929,14 +1153,14 @@ def cmd_review(result_path: Path):
 # status
 # ═══════════════════════════════════════════════════════════════════════
 
-def cmd_status():
+def cmd_status(project_arg: Optional[str] = None):
     """显示当前进度。"""
-    state_path = _get_state_path()
+    state_path = _get_state_path(project_arg)
     if not state_path.is_file():
         print("未初始化。运行 init 开始。")
         return
 
-    state = _load_state()
+    state = _load_state(project_arg)
     batch_idx = state["current_batch"]
     if batch_idx < len(state["batches"]):
         s, e = state["batches"][batch_idx]
@@ -957,14 +1181,14 @@ def cmd_status():
 # retry
 # ═══════════════════════════════════════════════════════════════════════
 
-def cmd_retry():
+def cmd_retry(project_arg: Optional[str] = None):
     """重新生成当前批次的翻译 JSON（用于 Agent 输出格式错误后重试）。"""
-    state = _load_state()
+    state = _load_state(project_arg)
     if state["current_batch"] >= len(state["batches"]):
         print("✅ 全部已完成，无需重试。")
         return
     print("🔄 重新生成当前批次...")
-    cmd_next()
+    cmd_next(project_arg=state.get("project_id") or state["stem"])
 
 
 def cmd_summary(report_file: Path, stem_arg: Optional[str]):
@@ -1118,12 +1342,20 @@ def cmd_export(stem_arg: Optional[str], out_arg: Optional[str], force: bool):
                 sys.path.insert(0, str(_SCRIPT_DIR))
                 from mqxliff_tool import parse_mqxliff
                 units, _ = parse_mqxliff(candidate)
-                empty = sum(
-                    1 for unit in units
-                    if not unit.is_locked and not (unit.target_text or "").strip()
+                policy = record.get("validation_policy") or load_validation_policy(
+                    record.get("validation_policy_path")
                 )
-                if empty:
-                    raise ValueError(f"有 {empty}/{len(units)} 条可翻译单元为空")
+                empty_ids = [
+                    unit.id for unit in units
+                    if not unit.is_locked
+                    and not (unit.target_text or "").strip()
+                    and not effective_entry_policy(policy, unit.id)["allow_empty"]
+                ]
+                if empty_ids:
+                    raise ValueError(
+                        f"有 {len(empty_ids)}/{len(units)} 条可翻译单元为空: "
+                        f"{empty_ids[:20]}"
+                    )
                 print(f"  ✅ 导出校验通过：{len(units)} 条 trans-unit")
             except Exception as exc:
                 print(f"❌ 导出校验失败（文件可能损坏）: {exc}")
@@ -1208,6 +1440,117 @@ def cmd_term_gaps(stem_arg: Optional[str], out_arg: Optional[str]):
     print(f"✅ 术语缺口清单已生成: {out}")
 
 
+def _split_context_entries(entries: list[dict], max_chars: int) -> list[list[dict]]:
+    if max_chars <= 0:
+        raise ValueError("max_chars 必须大于 0")
+    parts = []
+    current = []
+    current_chars = 0
+    for entry in entries:
+        entry_chars = len(str(entry.get("source", "")))
+        if current and current_chars + entry_chars > max_chars:
+            parts.append(current)
+            current = []
+            current_chars = 0
+        current.append(entry)
+        current_chars += entry_chars
+    if current:
+        parts.append(current)
+    return parts
+
+
+def cmd_context_split(max_chars: int, project_arg: Optional[str] = None) -> Path:
+    """Create complete-entry context-analysis parts and a manifest."""
+    state = _load_state(project_arg)
+    with open(state["export_file"], "r", encoding="utf-8") as f:
+        data = json.load(f)
+    try:
+        parts = _split_context_entries(data.get("entries", []), max_chars)
+    except ValueError as exc:
+        print(f"❌ {exc}")
+        sys.exit(1)
+    if not parts:
+        print("❌ 工作 JSON 中没有可分析条目")
+        sys.exit(1)
+
+    output_dir = _SCRIPT_DIR / "exports" / state["stem"] / "context_parts"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_parts = []
+    for index, entries in enumerate(parts, 1):
+        payload = {
+            "mode": "context_part",
+            "source_file": data.get("source_file", state.get("original_source_name")),
+            "part": index,
+            "total_parts": len(parts),
+            "instructions": (
+                "仅分析本分片并写出分片报告；保留所有重要 id 关联。"
+                "不得把分片结论冒充全局结论。"
+            ),
+            "source_warnings": data.get("warnings", []),
+            "entries": entries,
+        }
+        part_path = output_dir / f"context_part_{index:03d}.json"
+        _write_json_atomic(part_path, payload)
+        manifest_parts.append({
+            "part": index,
+            "path": str(part_path.resolve()),
+            "entries": len(entries),
+            "first_id": str(entries[0]["id"]),
+            "last_id": str(entries[-1]["id"]),
+        })
+    manifest = {
+        "project": state.get("project_id") or state["stem"],
+        "source_file": data.get("source_file", state.get("original_source_name")),
+        "max_chars": max_chars,
+        "total_parts": len(parts),
+        "parts": manifest_parts,
+    }
+    manifest_path = output_dir / "context_manifest.json"
+    _write_json_atomic(manifest_path, manifest)
+    print(f"✅ 语境分析已分为 {len(parts)} 片: {manifest_path}")
+    return manifest_path
+
+
+def cmd_context_pack(
+    report_paths: list[Path],
+    out_arg: Optional[str],
+    project_arg: Optional[str] = None,
+) -> Path:
+    """Pack ordered part reports into a final synthesis task JSON."""
+    project_id = _resolve_project_id(project_arg)
+    reports = []
+    for index, path in enumerate(report_paths, 1):
+        path = path.resolve()
+        if not path.is_file():
+            print(f"❌ 分片报告不存在: {path}")
+            sys.exit(1)
+        content = path.read_text(encoding="utf-8").strip()
+        if not content:
+            print(f"❌ 分片报告为空: {path}")
+            sys.exit(1)
+        reports.append({"part": index, "path": str(path), "report": content})
+
+    if out_arg:
+        output = Path(out_arg)
+    else:
+        output = (
+            _SCRIPT_DIR / "exports" / project_id / "context_parts"
+            / "context_merge_task.json"
+        )
+    payload = {
+        "mode": "context_merge",
+        "project": project_id,
+        "instructions": (
+            "综合全部分片报告为一份全局语境报告。去重并解决冲突，"
+            "补充跨分片关联；最终报告必须覆盖规定的全部章节。"
+        ),
+        "part_reports": reports,
+    }
+    _write_json_atomic(output, payload)
+    print(f"✅ 全局语境合并任务已生成: {output}")
+    return output
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════════════════
@@ -1239,22 +1582,47 @@ def main():
         action="store_true",
         help="从带已有译文的 mqxliff 恢复初始化（状态已存在时不覆盖，直接 next 继续）",
     )
+    p_init.add_argument(
+        "--project", type=str, default=None,
+        help="显式 project id（默认使用文件 stem；同名冲突时自动加路径哈希）",
+    )
+    p_init.add_argument(
+        "--force-reinit", action="store_true",
+        help="明确覆盖该 project 的现有初始化状态",
+    )
+
+    def add_project_argument(command_parser):
+        command_parser.add_argument(
+            "--project", "--stem", dest="project", type=str, default=None,
+            help="project id（默认使用 data/.active_project）",
+        )
 
     p_next = sub.add_parser("next", help="输出当前批翻译 JSON（--review 跳过翻译，直接校对）")
     p_next.add_argument("--review", action="store_true", help="跳过翻译，直接生成校对 JSON（用于已有译文的文件）")
+    add_project_argument(p_next)
     p_review = sub.add_parser("review", help="生成校对 JSON（翻译结果+原文对照）")
     p_review.add_argument("result", type=str, help="翻译结果 JSON 路径")
+    add_project_argument(p_review)
     p_submit = sub.add_parser("submit", help="提交校对结果并推进")
     p_submit.add_argument("result", type=str, help="校对后的结果 JSON 路径")
+    add_project_argument(p_submit)
+    p_submit.add_argument(
+        "--allow-warnings", action="store_true",
+        help="人工确认当前 warning 可接受后放行",
+    )
+    p_submit.add_argument(
+        "--warning-reason", type=str, default=None,
+        help="放行 warning 的具体理由（与 --allow-warnings 同时使用）",
+    )
     p_status = sub.add_parser("status", help="查看进度")
+    add_project_argument(p_status)
     p_retry = sub.add_parser("retry", help="重新生成当前批次翻译 JSON")
+    add_project_argument(p_retry)
     p_summary = sub.add_parser("summary", help="写入语境分析报告到 document_summary")
     p_summary.add_argument("report", type=str, help="报告文件路径（UTF-8 文本）")
-    p_summary.add_argument("--stem", type=str, default=None,
-                           help="项目 stem（默认 data/.active_project）")
+    add_project_argument(p_summary)
     p_refresh = sub.add_parser("refresh", help="重新解析工作文件并重跑术语/TM/风格指南增强")
-    p_refresh.add_argument("--stem", type=str, default=None,
-                           help="项目 stem（默认 data/.active_project）")
+    add_project_argument(p_refresh)
     p_refresh.add_argument("--tm", type=str, default=None,
                            help="TM JSON 路径（state 不存在时默认 data/tm_memory.json）")
     p_refresh.add_argument("--terms", type=str, default=None,
@@ -1262,16 +1630,26 @@ def main():
     p_refresh.add_argument("--style-guide", type=str, default=None,
                            help="风格指南 txt 路径（state 不存在时默认 data/style_guide.txt）")
     p_export = sub.add_parser("export", help="导出最终译文 mqxliff")
-    p_export.add_argument("--stem", type=str, default=None,
-                          help="项目 stem（默认 data/.active_project）")
+    add_project_argument(p_export)
     p_export.add_argument("--out", type=str, default=None,
                           help="输出路径（默认 已交付/<stem>.mqxliff）")
     p_export.add_argument("--force", action="store_true", help="覆盖已存在的目标文件")
     p_gaps = sub.add_parser("term-gaps", help="生成术语缺口待确认清单")
-    p_gaps.add_argument("--stem", type=str, default=None,
-                        help="项目 stem（默认 data/.active_project）")
+    add_project_argument(p_gaps)
     p_gaps.add_argument("--out", type=str, default=None,
                         help="输出路径（默认 _temp/term_gaps_<stem>.md）")
+    p_version = sub.add_parser("version", help="显示工具包与工作流协议版本")
+    p_version.add_argument("--json", action="store_true", help="以 JSON 输出")
+    p_context_split = sub.add_parser("context-split", help="生成语境分析分片")
+    p_context_split.add_argument(
+        "--max-chars", type=int, default=60000,
+        help="每片 source 字符上限（默认 60000，不拆分单条 entry）",
+    )
+    add_project_argument(p_context_split)
+    p_context_pack = sub.add_parser("context-pack", help="生成分片报告合并任务")
+    p_context_pack.add_argument("reports", nargs="+", type=Path, help="按顺序排列的分片报告")
+    p_context_pack.add_argument("--out", type=str, default=None, help="合并任务 JSON 路径")
+    add_project_argument(p_context_pack)
 
     args = parser.parse_args()
 
@@ -1291,25 +1669,49 @@ def main():
                 Path(args.validation_policy) if args.validation_policy else None
             ),
             resume=args.resume,
+            project_id=args.project,
+            force_reinit=args.force_reinit,
         )
     elif args.command == "next":
-        cmd_next(review_only=args.review)
+        cmd_next(review_only=args.review, project_arg=args.project)
     elif args.command == "review":
-        cmd_review(Path(args.result))
+        cmd_review(Path(args.result), args.project)
     elif args.command == "submit":
-        cmd_submit(Path(args.result))
+        cmd_submit(
+            Path(args.result),
+            args.project,
+            allow_warnings=args.allow_warnings,
+            warning_reason=args.warning_reason,
+        )
     elif args.command == "status":
-        cmd_status()
+        cmd_status(args.project)
     elif args.command == "retry":
-        cmd_retry()
+        cmd_retry(args.project)
     elif args.command == "summary":
-        cmd_summary(Path(args.report), args.stem)
+        cmd_summary(Path(args.report), args.project)
     elif args.command == "refresh":
-        cmd_refresh(args.stem, args.tm, args.terms, args.style_guide)
+        cmd_refresh(args.project, args.tm, args.terms, args.style_guide)
     elif args.command == "export":
-        cmd_export(args.stem, args.out, args.force)
+        cmd_export(args.project, args.out, args.force)
     elif args.command == "term-gaps":
-        cmd_term_gaps(args.stem, args.out)
+        cmd_term_gaps(args.project, args.out)
+    elif args.command == "version":
+        version_info = {
+            "toolkit_version": TOOLKIT_VERSION,
+            "workflow_protocol": WORKFLOW_PROTOCOL_VERSION,
+            "python_requires": ">=3.10",
+        }
+        if args.json:
+            print(json.dumps(version_info, ensure_ascii=False))
+        else:
+            print(
+                f"batch-translate {TOOLKIT_VERSION} "
+                f"(workflow protocol {WORKFLOW_PROTOCOL_VERSION}, Python >=3.10)"
+            )
+    elif args.command == "context-split":
+        cmd_context_split(args.max_chars, args.project)
+    elif args.command == "context-pack":
+        cmd_context_pack(args.reports, args.out, args.project)
     else:
         parser.print_help()
 

@@ -45,6 +45,20 @@ class TxtParserTest(unittest.TestCase):
             out = txt_parser.write(src, trans)
             self.assertEqual(out.read_text(encoding="utf-8"), "甲\n乙\n")
 
+    def test_write_can_clear_existing_text(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src = td / "sample.txt"
+            src.write_text("旧译文\n", encoding="utf-8")
+            data = txt_parser.parse(src)
+            data["entries"][0]["target"] = ""
+            trans = td / "trans.json"
+            trans.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+            out = txt_parser.write(src, trans)
+
+            self.assertEqual(out.read_text(encoding="utf-8"), "\n")
+
 
 class XlsxParserTest(unittest.TestCase):
     def _make_wb(self, path: Path):
@@ -107,6 +121,22 @@ class XlsxParserTest(unittest.TestCase):
             ws = openpyxl.load_workbook(out).active
             self.assertEqual(ws.cell(row=4, column=3).value, "萨菲罗斯")
             self.assertEqual(ws.cell(row=5, column=3).value, "蒂法")
+
+    def test_write_can_clear_existing_target_cell(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "sample.xlsx"
+            self._make_wb(src)
+            data = xlsx_parser.parse(src, source_col="A", target_col="C", header_row=3)
+            data["entries"][0]["target"] = ""
+            export = Path(td) / "parsed.json"
+            export.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+            out = xlsx_parser.write(src, export)
+
+            import openpyxl
+
+            ws = openpyxl.load_workbook(out).active
+            self.assertIsNone(ws.cell(row=4, column=3).value)
 
     def test_source_column_to_the_right_is_parsed(self):
         with tempfile.TemporaryDirectory() as td:
@@ -177,6 +207,98 @@ class DocxParserTest(unittest.TestCase):
             self.assertEqual("".join(run.text for run in runs), "加粗普通")
             self.assertTrue(runs[0].bold)
             self.assertFalse(bool(runs[-1].bold))
+
+    def test_write_can_clear_existing_paragraph(self):
+        from docx import Document
+
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "clear.docx"
+            doc = Document()
+            doc.add_paragraph("旧译文")
+            doc.save(src)
+            data = docx_parser.parse(src)
+            data["entries"][0]["target"] = ""
+            export = Path(td) / "clear.json"
+            export.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+            out = docx_parser.write(src, export)
+
+            self.assertEqual(Document(out).paragraphs[0].text, "")
+
+    def test_position_ids_do_not_shift_after_clearing_paragraph(self):
+        from docx import Document
+
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "stable.docx"
+            doc = Document()
+            doc.add_paragraph("第一段")
+            doc.add_paragraph("")
+            doc.add_paragraph("第三段")
+            doc.save(src)
+            data = docx_parser.parse(src)
+            ids = [entry["id"] for entry in data["entries"]]
+            self.assertEqual(ids, ["body.p0", "body.p2"])
+            data["entries"][0]["target"] = ""
+            data["entries"][1]["target"] = "第三段译文"
+            export = Path(td) / "stable.json"
+            export.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+            out = docx_parser.write(src, export)
+            reparsed = docx_parser.parse(out)
+
+            self.assertEqual(reparsed["entries"][0]["id"], "body.p2")
+            self.assertEqual(reparsed["entries"][0]["source"], "第三段译文")
+
+    def test_all_table_cells_nested_tables_headers_and_footers_roundtrip(self):
+        from docx import Document
+
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "stories.docx"
+            doc = Document()
+            table = doc.add_table(rows=1, cols=2)
+            table.cell(0, 0).text = "左单元格"
+            table.cell(0, 1).text = "右单元格"
+            nested = table.cell(0, 1).add_table(rows=1, cols=1)
+            nested.cell(0, 0).text = "嵌套单元格"
+            doc.sections[0].header.paragraphs[0].text = "页眉"
+            doc.sections[0].footer.paragraphs[0].text = "页脚"
+            doc.save(src)
+
+            data = docx_parser.parse(src)
+            by_source = {entry["source"]: entry for entry in data["entries"]}
+            expected = {"左单元格", "右单元格", "嵌套单元格", "页眉", "页脚"}
+            self.assertTrue(expected.issubset(by_source))
+            for source in expected:
+                by_source[source]["target"] = f"译-{source}"
+            export = Path(td) / "stories.json"
+            export.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+            out = docx_parser.write(src, export)
+            reparsed = docx_parser.parse(out)
+            translated = {entry["source"] for entry in reparsed["entries"]}
+
+            self.assertTrue({f"译-{source}" for source in expected}.issubset(translated))
+
+    def test_text_box_is_reported_as_unsupported(self):
+        from docx import Document
+        from docx.oxml import parse_xml
+        from docx.oxml.ns import nsdecls
+
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "textbox.docx"
+            doc = Document()
+            run = doc.add_paragraph("正文").add_run()
+            run._r.append(parse_xml(
+                f'<w:pict {nsdecls("w")} xmlns:v="urn:schemas-microsoft-com:vml">'
+                '<v:shape><v:textbox><w:txbxContent><w:p><w:r>'
+                '<w:t>文本框内容</w:t></w:r></w:p></w:txbxContent>'
+                '</v:textbox></v:shape></w:pict>'
+            ))
+            doc.save(src)
+
+            data = docx_parser.parse(src)
+
+            self.assertTrue(any("文本框" in warning for warning in data["warnings"]))
 
 
 if __name__ == "__main__":

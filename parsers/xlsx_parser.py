@@ -85,7 +85,7 @@ def write(original_path: Path, translations_json: str | Path,
         target_map = {str(r["id"]): r["target"] for r in translations}
     elif isinstance(translations, dict) and "entries" in translations:
         for e in translations["entries"]:
-            if e.get("target"):
+            if "target" in e and isinstance(e["target"], str):
                 target_map[str(e["id"])] = e["target"]
             if e.get("_row") is not None:
                 row_map[str(e["id"])] = int(e["_row"])

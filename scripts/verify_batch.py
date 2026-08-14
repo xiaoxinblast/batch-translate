@@ -67,7 +67,12 @@ def main():
     parser.add_argument(
         "--allow-warnings",
         action="store_true",
-        help="人工判定剩余警告可接受后放行（原因由调用方记录）",
+        help="人工判定剩余警告可接受后放行",
+    )
+    parser.add_argument(
+        "--warning-reason",
+        default=None,
+        help="放行 warning 的具体理由（与 --allow-warnings 同时使用）",
     )
     parser.add_argument(
         "--policy",
@@ -75,6 +80,9 @@ def main():
         help="项目验证策略 JSON（默认使用 state 中记录的路径或内置策略）",
     )
     args = parser.parse_args()
+    if args.allow_warnings and not str(args.warning_reason or "").strip():
+        print("FATAL: --allow-warnings 必须同时提供非空 --warning-reason")
+        sys.exit(2)
     stem = args.stem
 
     # 加载状态
@@ -113,8 +121,11 @@ def main():
         sys.exit(1)
 
     try:
-        policy = load_validation_policy(
-            args.policy or state.get("validation_policy_path")
+        policy = (
+            load_validation_policy(args.policy)
+            if args.policy
+            else state.get("validation_policy")
+            or load_validation_policy(state.get("validation_policy_path"))
         )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"FATAL: 验证策略无效: {exc}")
@@ -131,15 +142,17 @@ def main():
         for warning in report.warnings:
             print(f"  - {warning}")
         if args.allow_warnings:
+            print(f"ACCEPTANCE REASON: {args.warning_reason.strip()}")
             print(
                 f"RESULT: PASS (warnings accepted, {len(report.warnings)} accepted) "
                 f"({len(report.entries)} entries, batch {batch_num}/{state['total_batches']})"
             )
         else:
             print(
-                f"RESULT: PASS with warnings ({len(report.entries)} entries, "
+                f"RESULT: BLOCKED with warnings ({len(report.entries)} entries, "
                 f"batch {batch_num}/{state['total_batches']})"
             )
+            sys.exit(3)
         sys.exit(0)
 
     print(
