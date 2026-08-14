@@ -35,6 +35,17 @@ def _full_scan(tm: TranslationMemory, source: str, threshold: float = 0.6, top_n
 
 
 class TmIndexTest(unittest.TestCase):
+    def test_corrupt_tm_is_not_treated_as_empty_or_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tm.json"
+            original = b'{"entries": ['
+            path.write_bytes(original)
+            tm = TranslationMemory(path)
+
+            with self.assertRaises(ValueError):
+                tm.add([{"source": "原文", "target": "译文"}])
+            self.assertEqual(path.read_bytes(), original)
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self._tmp.name)

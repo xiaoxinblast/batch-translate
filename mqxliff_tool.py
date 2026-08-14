@@ -761,6 +761,7 @@ def export_to_json(
             "note": tu.note,
             "source": tu.source_text,
             "target": tu.target_text,
+            "source_locked": tu.is_locked,
         }
         if tu.maxlengthchars:
             record["maxlengthchars"] = tu.maxlengthchars
@@ -845,6 +846,10 @@ def import_from_json(
     entries = data.get("entries", [])
     source_file_name = data.get("source_file", str(Path(mqxliff_path).name))
 
+    # 先解析源文件，以便识别“源文件锁定且 target 为空”的合法无操作提交。
+    trans_units, tree = parse_mqxliff(mqxliff_path)
+    locked_ids = {tu.id for tu in trans_units if tu.is_locked}
+
     _tag_strip_re = re.compile(r"<[^>]+>")
 
     translations = {}
@@ -862,20 +867,29 @@ def import_from_json(
                 if not _tag_strip_re.sub("", source_tagged).strip():
                     continue
                 tm_new_entries.append({
+                    "_id": str(entry["id"]),
                     "source": source_tagged,
                     "target": target.strip(),
                     "context": entry.get("context", ""),
                     "file": source_file_name,
                 })
 
-    if not translations:
+    has_untranslated = any(
+        not str(entry.get("target", "") or "").strip()
+        and str(entry.get("id")) not in locked_ids
+        for entry in entries
+    )
+    if not translations and (has_untranslated or not entries):
         print("❌ JSON 中没有任何 target 翻译内容。")
         sys.exit(1)
 
     print(f"📥 从 JSON 读取到 {len(translations)} 条翻译")
 
-    # 解析 mqxliff
-    trans_units, tree = parse_mqxliff(mqxliff_path)
+    tm_new_entries = [
+        {key: value for key, value in entry.items() if key != "_id"}
+        for entry in tm_new_entries
+        if entry["_id"] not in locked_ids
+    ]
 
     # 写回
     result_path = write_translations(

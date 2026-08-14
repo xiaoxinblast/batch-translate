@@ -9,11 +9,15 @@
 
 import argparse
 import json
+import os
 import re
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
+
+from validation import load_validation_policy, validate_batch_results
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -63,14 +67,60 @@ def _load_state() -> dict:
 
 def _save_state(state: dict):
     state_path = _get_state_path()
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(state_path, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    _write_json_atomic(state_path, state)
+
+
+def _write_json_atomic(path: Path, data) -> None:
+    """Write JSON beside its destination and atomically replace it."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        Path(temp_name).unlink(missing_ok=True)
+        raise
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # helpers
 # ═══════════════════════════════════════════════════════════════════════
+
+
+def _build_parse_args(work_file: Path, export_file: Path, state: dict) -> list[str]:
+    args = [
+        sys.executable,
+        str(_SCRIPT_DIR / "convert.py"),
+        "parse",
+        str(work_file),
+        "--output",
+        str(export_file),
+    ]
+    if work_file.suffix.lower() in (".xlsx", ".xlsm"):
+        args += [
+            "--source-col",
+            state.get("source_col", "A"),
+            "--target-col",
+            state.get("target_col", "B"),
+            "--header-row",
+            str(state.get("header_row", 1)),
+        ]
+        if state.get("sheet_name"):
+            args += ["--sheet", state["sheet_name"]]
+    if work_file.suffix.lower() == ".mqxliff":
+        args += ["--output-dir", str(export_file.parent)]
+    return args
+
 
 def _accumulate_tm(export_file: Path, tm_path: str):
     """非 mqxliff 格式的 TM 积累。"""
@@ -238,7 +288,10 @@ def _build_review_json(
             "source": e["source"],
             "translated": translated,
         }
-        if review_only:
+        if e.get("source_locked"):
+            item["source_locked"] = True
+            item["locked"] = True
+        elif review_only:
             # review 模式：已有译文是待校对对象，不标记为锁定
             item["locked"] = False
         elif "locked" in e:
@@ -276,9 +329,22 @@ def cmd_init(
     source_col: str = "A",
     target_col: str = "B",
     header_row: int = 1,
+    sheet_name: Optional[str] = None,
+    validation_policy_path: Optional[Path] = None,
     resume: bool = False,
 ):
     """初始化批量翻译：解析源文件 → 中间 JSON，写入 state。"""
+    source_path = source_path.resolve()
+    if not source_path.is_file():
+        print(f"❌ 源文件不存在: {source_path}")
+        sys.exit(1)
+    if validation_policy_path:
+        try:
+            load_validation_policy(validation_policy_path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"❌ 验证策略无效: {exc}")
+            sys.exit(1)
+
     stem = source_path.stem  # 不含扩展名的文件名，用作目录名
     _set_active_stem(stem)
 
@@ -313,6 +379,8 @@ def cmd_init(
     if source_path.suffix.lower() in (".xlsx", ".xlsm"):
         parse_args += ["--source-col", source_col, "--target-col", target_col,
                        "--header-row", str(header_row)]
+        if sheet_name:
+            parse_args += ["--sheet", sheet_name]
     if source_path.suffix.lower() == ".mqxliff":
         parse_args += ["--output-dir", str(export_dir)]
 
@@ -324,6 +392,9 @@ def cmd_init(
         data = json.load(f)
     entries = data["entries"]
     total = len(entries)
+    if total == 0:
+        print("❌ 源文件中没有可翻译条目，未创建批次状态")
+        sys.exit(1)
 
     # 按字数分批
     import re
@@ -352,6 +423,8 @@ def cmd_init(
 
     state = {
         "stem": stem,
+        "original_source_name": source_path.name,
+        "input_source_file": str(source_path.resolve()),
         "source_file": str(work_file.resolve()),
         "source_format": data.get("_format", source_path.suffix.lower().lstrip(".")),
         "export_file": str(export_file.resolve()),
@@ -365,6 +438,13 @@ def cmd_init(
         "terms_path": str(terms_path.resolve()) if terms_path else None,
         "tm_path": str(tm_path.resolve()) if tm_path else None,
         "style_guide_path": str(style_guide_path.resolve()) if style_guide_path else None,
+        "validation_policy_path": (
+            str(validation_policy_path.resolve()) if validation_policy_path else None
+        ),
+        "source_col": source_col,
+        "target_col": target_col,
+        "header_row": header_row,
+        "sheet_name": sheet_name,
     }
     _save_state(state)
 
@@ -468,6 +548,8 @@ def cmd_next(review_only: bool = False):
     # 构建批次条目：已有译文的条目注入为 locked，空条目正常翻译
     batch_entries = []
     locked_count = 0
+    existing_locked_count = 0
+    source_locked_count = 0
     for e in entries[start:end]:
         existing_target = e.get("target", "").strip()
         item = {
@@ -484,12 +566,23 @@ def cmd_next(review_only: bool = False):
             item["tm_matches"] = e["tm_matches"]
         if e.get("tm_fragments"):
             item["tm_fragments"] = e["tm_fragments"]
-        # 混合文件支持：已有译文 → 锁定，空条目 → 待翻译
-        if existing_target:
+        if e.get("maxlengthchars"):
+            item["maxlengthchars"] = e["maxlengthchars"]
+        if e.get("source_locked"):
+            item["source_locked"] = True
+        # 源文件锁定优先；否则混合文件中的已有译文继续按现有策略锁定。
+        if e.get("source_locked"):
+            item["target"] = existing_target
+            item["locked"] = True
+            item["note"] = (item.get("note", "") + " 【源文件锁定，严禁修改】").strip()
+            locked_count += 1
+            source_locked_count += 1
+        elif existing_target:
             item["target"] = existing_target
             item["locked"] = True
             item["note"] = (item.get("note", "") + " 【已有100%匹配译文，严禁修改】").strip()
             locked_count += 1
+            existing_locked_count += 1
         else:
             item["target"] = ""
             item["locked"] = False
@@ -498,8 +591,17 @@ def cmd_next(review_only: bool = False):
     # 构建 batch JSON
     batch = {}
     if locked_count > 0:
+        locked_details = []
+        if existing_locked_count:
+            locked_details.append(
+                f"{existing_locked_count} 条已有译文（target 已填入）"
+            )
+        if source_locked_count:
+            locked_details.append(
+                f"{source_locked_count} 条源文件锁定条目（target 可能为空）"
+            )
         instr = (
-            f"本批共 {len(batch_entries)} 条，其中 {locked_count} 条 locked=true（已有100%匹配译文，target 已填入），"
+            f"本批共 {len(batch_entries)} 条，其中 {'；'.join(locked_details)}，"
             f"请直接保留其 target，严禁对译文进行任何改动。"
             f"其余 {len(batch_entries) - locked_count} 条 target 为空，需要从零翻译。"
         )
@@ -530,7 +632,15 @@ def cmd_next(review_only: bool = False):
 
     print(f"📤 Batch {batch_num}/{state['total_batches']}  条目 {start + 1}-{end}（共 {total} 条）")
     if locked_count > 0:
-        print(f"   🔒 其中 {locked_count} 条已有译文（locked=true），{len(batch_entries) - locked_count} 条待翻译")
+        locked_details = []
+        if existing_locked_count:
+            locked_details.append(f"{existing_locked_count} 条已有译文")
+        if source_locked_count:
+            locked_details.append(f"{source_locked_count} 条源文件锁定")
+        print(
+            f"   🔒 其中 {'，'.join(locked_details)}（locked=true），"
+            f"{len(batch_entries) - locked_count} 条待翻译"
+        )
     print(f"   输出: {out_path.name}")
     if context_entries:
         print(f"   上文: {len(context_entries)} 条（id={context_entries[0]['id']}-{context_entries[-1]['id']}）")
@@ -542,81 +652,54 @@ def cmd_next(review_only: bool = False):
 # submit
 # ═══════════════════════════════════════════════════════════════════════
 
-def _validate_submission(results: list, state: dict) -> None:
-    """提交前分级校验：致命错误退出（不写回、不推进），非致命仅警告。
+def _load_expected_batch_entries(state: dict, export_data: dict) -> list[dict]:
+    """Load the exact task contract, including locked targets and length limits."""
+    batch_index = state["current_batch"]
+    batch_num = batch_index + 1
+    project_exports = _SCRIPT_DIR / "exports" / state["stem"]
+    for suffix in ("to_review", "to_translate"):
+        task_path = project_exports / f"_batch_{batch_num:03d}_{suffix}.json"
+        if task_path.is_file():
+            with open(task_path, "r", encoding="utf-8") as f:
+                task = json.load(f)
+            if isinstance(task.get("entries"), list):
+                return task["entries"]
 
-    致命：缺 id/target 字段、重复 id、本批预期 id 未全覆盖。
-    警告：内联标签数与 source 不一致、target 为空但 source 有可译文本、
-          提交了不属于本批的 id。
-    """
-    import re
-    from collections import Counter
+    start, end = state["batches"][batch_index]
+    expected = []
+    for source_entry in export_data["entries"][start:end]:
+        entry = dict(source_entry)
+        entry["locked"] = bool(source_entry.get("source_locked"))
+        expected.append(entry)
+    return expected
 
+
+def _validate_submission(results, state: dict) -> list[dict]:
+    """Run the same strict validation used by Step 4.5."""
     export_file = Path(state["export_file"])
     with open(export_file, "r", encoding="utf-8") as f:
         export_data = json.load(f)
-    start, end = state["batches"][state["current_batch"]]
-    batch_entries = export_data["entries"][start:end]
-    expected_ids = {str(e["id"]) for e in batch_entries}
-    source_by_id = {str(e["id"]): e.get("source", "") for e in batch_entries}
-
-    # ── 致命：字段完整性 ──
-    for i, r in enumerate(results):
-        if not isinstance(r, dict) or "id" not in r:
-            print(f"❌ 校验失败：第 {i} 条缺少 'id' 字段，未写回、状态未推进")
-            sys.exit(1)
-        if "target" not in r:
-            print(f"❌ 校验失败：id={r.get('id')} 缺少 'target' 字段，未写回、状态未推进")
-            sys.exit(1)
-
-    submitted_ids = [str(r["id"]) for r in results]
-
-    # ── 致命：重复 id ──
-    dupes = [i for i, c in Counter(submitted_ids).items() if c > 1]
-    if dupes:
-        print(f"❌ 校验失败：结果含重复 id（{len(dupes)} 个）：{sorted(dupes)[:20]}")
-        print("   → 未写回、状态未推进，可修正后重新 submit。")
+    expected_entries = _load_expected_batch_entries(state, export_data)
+    try:
+        policy = load_validation_policy(state.get("validation_policy_path"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"❌ 验证策略无效: {exc}")
         sys.exit(1)
 
-    # ── 致命：本批预期 id 未全覆盖 ──
-    submitted_set = set(submitted_ids)
-    missing = expected_ids - submitted_set
-    if missing:
-        print(f"❌ 校验失败：缺少本批 {len(missing)}/{len(expected_ids)} 条译文"
-              f"（提交 {len(submitted_set)} 条，可能只提交了改动条）")
-        print(f"   缺失 id（前 20）：{sorted(missing)[:20]}")
-        print("   → 未写回、状态未推进，请补全全部条目后重新 submit。")
+    report = validate_batch_results(results, expected_entries, policy)
+    if report.fatal:
+        print("❌ 提交校验失败，未写回、状态未推进:")
+        for message in report.fatal:
+            print(f"   - {message}")
         sys.exit(1)
-
-    # ── 警告：不属于本批的 id ──
-    extra = submitted_set - expected_ids
-    if extra:
-        print(f"⚠️ 警告：{len(extra)} 条 id 不属于本批（将按 id 匹配写到对应条目，"
-              f"请确认无误）：{sorted(extra)[:20]}")
-
-    # ── 警告：标签数 / 空 target ──
-    TAG_RE = re.compile(r"<tag\s+id=['\"][^'\"]+['\"].*?/>")
-    STRIP_TAG = re.compile(r"<[^>]+>")
-    tag_warn, empty_warn = [], []
-    for r in results:
-        rid = str(r["id"])
-        target = r.get("target") or ""
-        source = source_by_id.get(rid, "")
-        if "<tag" in source and len(TAG_RE.findall(source)) != len(TAG_RE.findall(target)):
-            tag_warn.append(rid)
-        if not target.strip() and STRIP_TAG.sub("", source).strip():
-            empty_warn.append(rid)
-    if tag_warn:
-        print(f"⚠️ 警告：{len(tag_warn)} 条内联标签数与 source 不一致：{tag_warn[:20]}")
-    if empty_warn:
-        print(f"⚠️ 警告：{len(empty_warn)} 条 target 为空但 source 含可译文本：{empty_warn[:20]}")
-
-    tail = "（含警告，见上）" if (extra or tag_warn or empty_warn) else ""
-    print(f"✅ 提交校验通过：{len(results)} 条，本批 id 全覆盖{tail}")
+    for warning in report.warnings:
+        print(f"⚠️ {warning}")
+    print(f"✅ 提交校验通过：{len(report.entries)} 条")
+    return report.entries
 
 
 def cmd_submit(result_path: Path):
-    """合并 AI 翻译结果，写回 mqxliff，推进到下一批。"""
+    """Validate and commit one batch as a recoverable transaction."""
     state = _load_state()
     state_path = _get_state_path()
 
@@ -647,21 +730,16 @@ def cmd_submit(result_path: Path):
                     print(f"   ⚠️ 文件中含字面 tab 字符，行号: {lines_with_tab}")
             sys.exit(1)
 
-    if not isinstance(results, list):
-        print("❌ 结果格式错误：应为 JSON 数组 [{id, target}, ...]")
-        sys.exit(1)
-
-    # 提交前分级校验（致命错误退出、不写回、不推进）
-    _validate_submission(results, state)
+    # 与 Step 4.5 共用同一校验器；返回已规范化的扁平数组。
+    results = _validate_submission(results, state)
 
     result_map = {str(r["id"]): r["target"] for r in results}
     print(f"📥 读取到 {len(result_map)} 条翻译")
 
-    # 合并到 export JSON（先备份，失败时恢复）
+    # 先在内存合并；批外 id 已由共享校验器拒绝。
     export_file = Path(state["export_file"])
     with open(export_file, "r", encoding="utf-8") as f:
         data = json.load(f)
-    backup_data = json.dumps(data, ensure_ascii=False)  # 回滚用
 
     merged = 0
     for e in data["entries"]:
@@ -669,73 +747,123 @@ def cmd_submit(result_path: Path):
             e["target"] = result_map[e["id"]]
             merged += 1
 
-    with open(export_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    print(f"   已合并 {merged} 条 → {export_file.name}")
-
-    # 写回源文件
     import subprocess
     work_file = Path(state["source_file"])
     tm_path = state.get("tm_path")
+    tm_file = Path(tm_path) if tm_path else None
 
-    try:
-        if state["source_format"] == "mqxliff":
-            # mqxliff: 用 mqxliff_tool.py import（含 TM 积累）
-            import_args = [
-                sys.executable, str(_SCRIPT_DIR / "mqxliff_tool.py"), "import",
-                str(export_file),
-                str(work_file),
-                "--output", str(work_file),
-            ]
-            if tm_path:
-                import_args += ["--save-tm", str(tm_path)]
-            subprocess.run(import_args, check=True)
-        else:
-            # 其他格式: convert.py write
-            write_args = [
-                sys.executable, str(_SCRIPT_DIR / "convert.py"), "write",
-                str(work_file),
-                str(export_file),
-                "--output", str(work_file),
-            ]
-            subprocess.run(write_args, check=True)
-            # TM 积累：追加翻译到 tm_memory.json
-            if tm_path:
-                _accumulate_tm(export_file, tm_path)
+    # 备份与候选文件放在工作文件同一卷，便于最终原子替换。
+    with tempfile.TemporaryDirectory(
+        prefix=f".submit_{state['stem']}_", dir=work_file.parent
+    ) as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        export_backup = temp_dir / "export.backup.json"
+        work_backup = temp_dir / f"work.backup{work_file.suffix}"
+        state_backup = temp_dir / "state.backup.json"
+        shutil.copy2(export_file, export_backup)
+        shutil.copy2(work_file, work_backup)
+        shutil.copy2(state_path, state_backup)
+        tm_existed = bool(tm_file and tm_file.is_file())
+        tm_backup = temp_dir / "tm.backup.json"
+        if tm_existed and tm_file:
+            shutil.copy2(tm_file, tm_backup)
+        manifest_path = (
+            _SCRIPT_DIR / "exports" / state["stem"] / "project_manifest.json"
+        )
+        manifest_existed = manifest_path.is_file()
+        manifest_backup = temp_dir / "manifest.backup.json"
+        if manifest_existed:
+            shutil.copy2(manifest_path, manifest_backup)
 
-        # review 全译文模式：target 已由校对确认，跳过重新 parse 与术语/TM 增强
-        # （避免每批提交都全量重算 36k 术语 × 全部条目的匹配，造成数分钟等待）
-        if state.get("existing_targets") == state["total"]:
-            print("ℹ️ review 模式：跳过重新解析与术语/TM 增强")
-        else:
-            # 重新 parse（TM 已更新，获取最新 matches）
-            reexport_file = _SCRIPT_DIR / "exports" / state["stem"] / "_working.json"
-            parse_args = [
-                sys.executable, str(_SCRIPT_DIR / "convert.py"), "parse",
-                str(work_file),
-                "--output", str(reexport_file),
-            ]
-            subprocess.run(parse_args, check=True)
+        merged_file = temp_dir / "merged.json"
+        _write_json_atomic(merged_file, data)
+        completed = False
 
-            # 对工作 JSON 做术语/TM/风格指南增强
-            _enrich_working_json(reexport_file, state)
+        try:
+            if state["source_format"] == "mqxliff":
+                candidate_work = temp_dir / f"candidate{work_file.suffix}"
+                import_args = [
+                    sys.executable,
+                    str(_SCRIPT_DIR / "mqxliff_tool.py"),
+                    "import",
+                    str(merged_file),
+                    str(work_file),
+                    "--output",
+                    str(candidate_work),
+                ]
+                if tm_path:
+                    import_args += ["--save-tm", str(tm_path)]
+                subprocess.run(import_args, check=True)
 
-    except Exception:
-        # 回滚：恢复 _working.json，状态不变
-        with open(export_file, "w", encoding="utf-8") as f:
-            f.write(backup_data)
-        print("❌ 提交失败，已回滚 _working.json，状态未推进，可安全重试。")
-        raise
+                if state.get("existing_targets") == state["total"]:
+                    committed_export = merged_file
+                    print("ℹ️ review 模式：跳过重新解析与术语/TM 增强")
+                else:
+                    committed_export = temp_dir / "reparsed.json"
+                    parse_args = _build_parse_args(
+                        candidate_work, committed_export, state
+                    )
+                    subprocess.run(parse_args, check=True)
+                    _enrich_working_json(committed_export, state)
 
-    # 推进状态
-    state["current_batch"] += 1
-    _save_state(state)
+                os.replace(candidate_work, work_file)
+                os.replace(committed_export, export_file)
+            else:
+                # 单列/表格格式保持原始工作副本不变，最终 export 时一次写回。
+                if tm_path:
+                    _accumulate_tm(merged_file, tm_path)
+                _enrich_working_json(merged_file, state)
+                os.replace(merged_file, export_file)
+
+            state["current_batch"] += 1
+            _save_state(state)
+            completed = state["current_batch"] >= len(state["batches"])
+            if completed:
+                manifest = dict(state)
+                manifest["completed"] = True
+                _write_json_atomic(manifest_path, manifest)
+                state_path.unlink()
+
+        except Exception:
+            rollback_errors = []
+            for backup, destination in (
+                (work_backup, work_file),
+                (export_backup, export_file),
+                (state_backup, state_path),
+            ):
+                try:
+                    shutil.copy2(backup, destination)
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"{destination}: {rollback_exc}")
+            if tm_file:
+                try:
+                    if tm_existed:
+                        shutil.copy2(tm_backup, tm_file)
+                    else:
+                        tm_file.unlink(missing_ok=True)
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"{tm_file}: {rollback_exc}")
+            try:
+                if manifest_existed:
+                    shutil.copy2(manifest_backup, manifest_path)
+                else:
+                    manifest_path.unlink(missing_ok=True)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"{manifest_path}: {rollback_exc}")
+            if rollback_errors:
+                print("❌ 提交失败，且以下文件回滚失败:")
+                for message in rollback_errors:
+                    print(f"   - {message}")
+            else:
+                print("❌ 提交失败，工作文件、JSON 与 TM 已完整回滚，状态未推进。")
+            raise
+
+    print(f"   已提交 {merged} 条 → {export_file.name}")
 
     # 检查是否全部完成
-    if state["current_batch"] >= len(state["batches"]):
+    if completed:
         print()
         print("🎉 全部翻译完成！")
-        state_path.unlink(missing_ok=True)
         return
 
     # 自动输出下一批（review 全译文模式继续走校对）
@@ -889,6 +1017,10 @@ def cmd_refresh(
             "terms_path": state.get("terms_path"),
             "tm_path": state.get("tm_path"),
             "style_guide_path": state.get("style_guide_path"),
+            "source_col": state.get("source_col", "A"),
+            "target_col": state.get("target_col", "B"),
+            "header_row": state.get("header_row", 1),
+            "sheet_name": state.get("sheet_name"),
         }
     else:
         work_file = _SCRIPT_DIR / "data" / stem / f"_working_{stem}.mqxliff"
@@ -899,6 +1031,10 @@ def cmd_refresh(
                        else str(_SCRIPT_DIR / "data" / "tm_memory.json"),
             "style_guide_path": str(Path(style_guide_arg).resolve()) if style_guide_arg
                                 else str(_SCRIPT_DIR / "data" / "style_guide.txt"),
+            "source_col": "A",
+            "target_col": "B",
+            "header_row": 1,
+            "sheet_name": None,
         }
 
     if not work_file.is_file():
@@ -912,12 +1048,7 @@ def cmd_refresh(
 
     export_file = _SCRIPT_DIR / "exports" / stem / "_working.json"
     export_file.parent.mkdir(parents=True, exist_ok=True)
-    parse_args = [
-        sys.executable, str(_SCRIPT_DIR / "convert.py"), "parse",
-        str(work_file), "--output", str(export_file),
-    ]
-    if work_file.suffix.lower() == ".mqxliff":
-        parse_args += ["--output-dir", str(export_file.parent)]
+    parse_args = _build_parse_args(work_file, export_file, enrich_state)
     subprocess.run(parse_args, check=True)
 
     _enrich_working_json(export_file, enrich_state)
@@ -927,49 +1058,111 @@ def cmd_refresh(
 
 
 def cmd_export(stem_arg: Optional[str], out_arg: Optional[str], force: bool):
-    """导出最终译文 mqxliff（默认复制到项目 已交付/ 目录）。"""
+    """Export the accumulated translations to the source format."""
+    import subprocess
+
     stem = _resolve_stem(stem_arg)
-    export_file = _SCRIPT_DIR / "exports" / stem / "_working.json"
+    project_dir = _SCRIPT_DIR / "exports" / stem
+    export_file = project_dir / "_working.json"
     if not export_file.is_file():
         print(f"❌ 工作 JSON 不存在: {export_file}")
         sys.exit(1)
-    work_file = _SCRIPT_DIR / "data" / stem / f"_working_{stem}.mqxliff"
+
+    state_path = _SCRIPT_DIR / "data" / stem / "batch_state.json"
+    manifest_path = project_dir / "project_manifest.json"
+    record = {}
+    for metadata_path in (state_path, manifest_path):
+        if metadata_path.is_file():
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                record = json.load(f)
+            break
+    if record.get("current_batch", 0) < record.get("total_batches", 0):
+        print("❌ 项目尚未完成全部批次，拒绝导出不完整文件")
+        sys.exit(1)
+
+    if record.get("source_file"):
+        work_file = Path(record["source_file"])
+    else:
+        candidates = sorted((_SCRIPT_DIR / "data" / stem).glob(f"_working_{stem}.*"))
+        work_file = candidates[0] if candidates else Path()
     if not work_file.is_file():
-        print(f"❌ 工作 mqxliff 不存在: {work_file}")
+        print(f"❌ 工作源文件不存在: {work_file}")
         sys.exit(1)
 
     if out_arg:
         dst = Path(out_arg)
     else:
-        dst = _SCRIPT_DIR.parent / "已交付" / f"{stem}.mqxliff"
+        output_name = record.get("original_source_name") or f"{stem}{work_file.suffix}"
+        dst = _SCRIPT_DIR.parent / "已交付" / output_name
     if dst.is_file() and not force:
         print(f"❌ 目标已存在（加 --force 覆盖）: {dst}")
         sys.exit(1)
 
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    # 始终以最新 _working.json 为事实源重新写回，避免直接修改 JSON 后导出旧数据
-    import subprocess
-    subprocess.run([
-        sys.executable, str(_SCRIPT_DIR / "mqxliff_tool.py"), "import",
-        str(export_file), str(work_file), "--output", str(dst),
-    ], check=True)
-
-    # 导出后校验：重新解析目标文件，确认 XML 合法且全部条目有译文
-    try:
-        sys.path.insert(0, str(_SCRIPT_DIR))
-        from mqxliff_tool import parse_mqxliff
-        units, _ = parse_mqxliff(dst)
-        total = len(units)
-        empty = sum(1 for u in units if not (u.target_text or "").strip())
-        if empty:
-            print(f"❌ 导出校验失败：{dst} 有 {empty}/{total} 条空译文")
-            sys.exit(1)
-        print(f"  ✅ 导出校验通过：{total} 条 trans-unit，全部有译文")
-    except SystemExit:
-        raise
-    except Exception as e:
-        print(f"❌ 导出校验失败（文件可能损坏）: {e}")
+    protected_paths = {work_file.resolve()}
+    if record.get("input_source_file"):
+        protected_paths.add(Path(record["input_source_file"]).resolve())
+    if dst.resolve() in protected_paths:
+        print("❌ 导出目标不得覆盖用户源文件或受管工作副本，请指定新文件")
         sys.exit(1)
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".export_", dir=dst.parent) as temp_name:
+        temp_dir = Path(temp_name)
+        candidate = temp_dir / f"candidate{work_file.suffix}"
+        if work_file.suffix.lower() == ".mqxliff":
+            subprocess.run([
+                sys.executable, str(_SCRIPT_DIR / "mqxliff_tool.py"), "import",
+                str(export_file), str(work_file), "--output", str(candidate),
+            ], check=True)
+            try:
+                sys.path.insert(0, str(_SCRIPT_DIR))
+                from mqxliff_tool import parse_mqxliff
+                units, _ = parse_mqxliff(candidate)
+                empty = sum(
+                    1 for unit in units
+                    if not unit.is_locked and not (unit.target_text or "").strip()
+                )
+                if empty:
+                    raise ValueError(f"有 {empty}/{len(units)} 条可翻译单元为空")
+                print(f"  ✅ 导出校验通过：{len(units)} 条 trans-unit")
+            except Exception as exc:
+                print(f"❌ 导出校验失败（文件可能损坏）: {exc}")
+                sys.exit(1)
+        else:
+            subprocess.run([
+                sys.executable, str(_SCRIPT_DIR / "convert.py"), "write",
+                str(work_file), str(export_file), "--output", str(candidate),
+            ], check=True)
+            parsed_file = temp_dir / "parsed.json"
+            subprocess.run(
+                _build_parse_args(candidate, parsed_file, record), check=True
+            )
+            with open(export_file, "r", encoding="utf-8") as f:
+                expected_data = json.load(f)
+            with open(parsed_file, "r", encoding="utf-8") as f:
+                parsed_data = json.load(f)
+            expected = {
+                str(entry["id"]): entry.get("target", "")
+                for entry in expected_data.get("entries", [])
+                if entry.get("target", "")
+            }
+            parsed = {str(entry["id"]): entry for entry in parsed_data.get("entries", [])}
+            strip_tags = re.compile(r"<tag\b[^<>]*/>")
+            mismatched = []
+            for entry_id, target in expected.items():
+                actual_entry = parsed.get(entry_id, {})
+                if work_file.suffix.lower() in (".xlsx", ".xlsm"):
+                    actual = actual_entry.get("target", "")
+                else:
+                    actual = actual_entry.get("source", "")
+                if strip_tags.sub("", actual) != strip_tags.sub("", target):
+                    mismatched.append(entry_id)
+            if mismatched:
+                print(f"❌ 导出校验失败，{len(mismatched)} 条译文不一致: {mismatched[:20]}")
+                sys.exit(1)
+            print(f"  ✅ 导出校验通过：{len(expected)} 条译文")
+
+        os.replace(candidate, dst)
 
     print(f"✅ 已导出: {dst}")
 
@@ -1034,6 +1227,14 @@ def main():
     p_init.add_argument("--target-col", type=str, default="B", help="xlsx 目标列（默认 B）")
     p_init.add_argument("--header-row", type=int, default=1, help="xlsx 表头行号（默认 1）")
     p_init.add_argument(
+        "--sheet", type=str, default=None,
+        help="xlsx 工作表名称；传 * 处理全部工作表（默认活动表）",
+    )
+    p_init.add_argument(
+        "--validation-policy", type=str, default=None,
+        help="项目验证策略 JSON 路径",
+    )
+    p_init.add_argument(
         "--resume",
         action="store_true",
         help="从带已有译文的 mqxliff 恢复初始化（状态已存在时不覆盖，直接 next 继续）",
@@ -1085,6 +1286,10 @@ def main():
             source_col=args.source_col,
             target_col=args.target_col,
             header_row=args.header_row,
+            sheet_name=args.sheet,
+            validation_policy_path=(
+                Path(args.validation_policy) if args.validation_policy else None
+            ),
             resume=args.resume,
         )
     elif args.command == "next":

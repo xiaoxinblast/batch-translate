@@ -1,6 +1,7 @@
 """docx 解析器：按段落提取，保留格式信息"""
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -51,22 +52,30 @@ def parse(filepath: Path, **opts) -> dict:
         if runs_info:
             format_info.append(", ".join(sorted(set(runs_info))))
 
-        # source 含内联格式标记
+        # source 含内联格式标记；run/格式维度使用唯一 id，供写回重建。
         source_parts = []
-        for run in para.runs:
+        for run_idx, run in enumerate(para.runs, 1):
             t = run.text
             if not t:
                 continue
+            formats = []
             if run.bold:
-                source_parts.append(f"<tag id='b{para_idx}' type='fmt' desc='粗体开始'/>")
-                source_parts.append(t)
-                source_parts.append(f"<tag id='/b{para_idx}' type='/fmt' desc='粗体结束'/>")
-            elif run.italic:
-                source_parts.append(f"<tag id='i{para_idx}' type='fmt' desc='斜体开始'/>")
-                source_parts.append(t)
-                source_parts.append(f"<tag id='/i{para_idx}' type='/fmt' desc='斜体结束'/>")
-            else:
-                source_parts.append(t)
+                formats.append(("b", "粗体"))
+            if run.italic:
+                formats.append(("i", "斜体"))
+            if run.underline:
+                formats.append(("u", "下划线"))
+            for code, label in formats:
+                marker_id = f"p{para_idx}r{run_idx}{code}"
+                source_parts.append(
+                    f"<tag id='{marker_id}' type='fmt' desc='{label}开始'/>"
+                )
+            source_parts.append(t)
+            for code, label in reversed(formats):
+                marker_id = f"/p{para_idx}r{run_idx}{code}"
+                source_parts.append(
+                    f"<tag id='{marker_id}' type='/fmt' desc='{label}结束'/>"
+                )
 
         source = "".join(source_parts) if source_parts else text
 
@@ -113,9 +122,6 @@ def write(original_path: Path, translations_json: str | Path,
             if e.get("target"):
                 target_map[str(e["id"])] = e["target"]
 
-    import re
-    tag_re = re.compile(r"<tag[^>]*/>")
-
     doc = Document(str(original_path))
     para_idx = 0
 
@@ -126,8 +132,7 @@ def write(original_path: Path, translations_json: str | Path,
         para_idx += 1
         tid = str(para_idx)
         if tid in target_map:
-            plain = tag_re.sub("", target_map[tid])
-            para.text = plain
+            _write_formatted_paragraph(para, target_map[tid])
 
     # 表格
     for table in doc.tables:
@@ -138,11 +143,49 @@ def write(original_path: Path, translations_json: str | Path,
             para_idx += 1
             tid = str(para_idx)
             if tid in target_map and row.cells:
-                plain = tag_re.sub("", target_map[tid])
-                row.cells[0].text = plain
+                cell = row.cells[0]
+                paragraph = cell.paragraphs[0]
+                _write_formatted_paragraph(paragraph, target_map[tid])
+                for extra in cell.paragraphs[1:]:
+                    extra.clear()
 
     if output_path is None:
         output_path = original_path.with_stem(original_path.stem + "_translated")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(output_path))
     return output_path
+
+
+_TAG_RE = re.compile(
+    r"<tag\s+id=['\"]([^'\"]+)['\"]\s+type=['\"]([^'\"]*)['\"]"
+    r"\s+desc=['\"]([^'\"]*)['\"]\s*/>"
+)
+
+
+def _write_formatted_paragraph(paragraph, target: str) -> None:
+    """Rebuild basic run formatting from the protected inline markers."""
+    paragraph.clear()
+    active = {"bold": False, "italic": False, "underline": False}
+    cursor = 0
+
+    def add_text(text: str) -> None:
+        if not text:
+            return
+        run = paragraph.add_run(text)
+        run.bold = active["bold"]
+        run.italic = active["italic"]
+        run.underline = active["underline"]
+
+    for match in _TAG_RE.finditer(target):
+        add_text(target[cursor:match.start()])
+        tag_type = match.group(2)
+        desc = match.group(3)
+        enabled = not tag_type.startswith("/")
+        if "粗体" in desc:
+            active["bold"] = enabled
+        elif "斜体" in desc:
+            active["italic"] = enabled
+        elif "下划线" in desc:
+            active["underline"] = enabled
+        cursor = match.end()
+    add_text(target[cursor:])

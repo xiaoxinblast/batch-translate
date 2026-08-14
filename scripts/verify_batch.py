@@ -6,7 +6,6 @@
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -14,10 +13,11 @@ from pathlib import Path
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-TAG_RE = re.compile(r"""<tag\s+id=['"][^'"]+['"].*?/>""")
-BR_RE = re.compile(r"""<tag\s+id=['"][^'"]+['"]\s+type=['"]br['"].*?/>""")
-BARE_TAG_RE = re.compile(r"<(?!tag\b)(/?[a-zA-Z][a-zA-Z0-9]*(?:=[^>]*)?)>")
 SCRIPT_DIR = Path(__file__).resolve().parent.parent  # batch_translate/
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from validation import load_validation_policy, validate_batch_results
 
 
 def _check_batch(
@@ -25,69 +25,40 @@ def _check_batch(
     src_by_id: dict[str, str],
     data,
     allow_warnings: bool = False,
+    policy: dict | None = None,
 ) -> tuple[list[str], list[str]]:
-    """纯逻辑校验：返回 (fatal 列表, warnings 列表)，供 CLI 与单测共用。"""
-    fatal: list[str] = []
-    warnings: list[str] = []
+    """Compatibility wrapper used by unit tests."""
+    expected = [
+        {"id": str(entry_id), "source": src_by_id.get(str(entry_id), "")}
+        for entry_id in expected_ids
+    ]
+    report = validate_batch_results(data, expected, policy)
+    return report.fatal, report.warnings
 
-    # 容错：自动解包 {"entries": [...]}
-    if isinstance(data, dict) and "entries" in data:
-        warnings.append("wrapped object {entries:[...]}, auto-unwrapped")
-        data = data["entries"]
 
-    if not isinstance(data, list):
-        return ["reviewed JSON 不是数组 → 退回校对步骤重跑"], warnings
+def _load_expected_entries(
+    state: dict, export_data: dict, stem: str | None = None
+) -> list[dict]:
+    """Prefer the generated batch task because it carries locked baselines."""
+    batch_index = state["current_batch"]
+    batch_num = batch_index + 1
+    project_stem = state.get("stem") or stem
+    project_exports = SCRIPT_DIR / "exports" / str(project_stem)
+    for suffix in ("to_review", "to_translate"):
+        task_path = project_exports / f"_batch_{batch_num:03d}_{suffix}.json"
+        if task_path.is_file():
+            with open(task_path, "r", encoding="utf-8") as f:
+                task = json.load(f)
+            if isinstance(task.get("entries"), list):
+                return task["entries"]
 
-    submitted_ids = [str(r.get("id")) for r in data]
-    sub_set = set(submitted_ids)
-    exp_set = set(expected_ids)
-
-    missing = exp_set - sub_set
-    extra = sub_set - exp_set
-
-    # ── 致命：条数不符 / id 未全覆盖 ──
-    if len(data) != len(expected_ids) or missing:
-        fatal.append(f"条数不符：预期 {len(expected_ids)}，实际 {len(data)}")
-        if missing:
-            fatal.append(f"缺失 id（前 20）：{sorted(missing)[:20]}")
-        fatal.append("→ 校对可能只输出了改动条，请要求输出本批全部条目后重跑")
-        return fatal, warnings
-
-    # ── 警告：标签数不一致（占位符/actor 条目豁免） ──
-    tag_bad = []
-    bare_bad = []
-    for r in data:
-        rid = str(r["id"])
-        src = src_by_id.get(rid, "")
-        tgt = r.get("target") or ""
-        # 致命：target 出现非 <tag .../> 形式的尖括号裸标签（TM 参考照抄特征）
-        if BARE_TAG_RE.search(tgt):
-            bare_bad.append(rid)
-        # br 换行标签允许按中文可读性省略/合并（原译文短时不强制与 source 一致），
-        # 只比对非 br 的内联标签数量
-        n_src = len(TAG_RE.findall(src)) - len(BR_RE.findall(src))
-        n_tgt = len(TAG_RE.findall(tgt)) - len(BR_RE.findall(tgt))
-        if "<tag" in src and n_src != n_tgt:
-            # 占位符条目：source 含 ⟨actor⟩ 且 target 保留该占位符标签时，
-            # 正文/换行等标签允许按项目规则省略，不做严格数量比对
-            if "⟨actor⟩" in src and "⟨actor⟩" in tgt:
-                continue
-            tag_bad.append(rid)
-
-    # ── 警告：多余 id ──
-    extra_list = sorted(extra) if extra else []
-
-    # ── 汇总 ──
-    if bare_bad:
-        fatal.append(
-            f"{len(bare_bad)} 条 target 含裸标签（非 <tag .../> 形式，疑似照抄 TM 参考）: "
-            f"{bare_bad[:20]}"
-        )
-    if tag_bad:
-        warnings.append(f"{len(tag_bad)} 条标签数与 source 不一致: {tag_bad[:20]}")
-    if extra_list:
-        warnings.append(f"{len(extra_list)} 条 id 不属于本批: {extra_list[:20]}")
-    return fatal, warnings
+    start, end = state["batches"][batch_index]
+    entries = []
+    for source_entry in export_data["entries"][start:end]:
+        entry = dict(source_entry)
+        entry["locked"] = bool(source_entry.get("source_locked"))
+        entries.append(entry)
+    return entries
 
 
 def main():
@@ -97,6 +68,11 @@ def main():
         "--allow-warnings",
         action="store_true",
         help="人工判定剩余警告可接受后放行（原因由调用方记录）",
+    )
+    parser.add_argument(
+        "--policy",
+        default=None,
+        help="项目验证策略 JSON（默认使用 state 中记录的路径或内置策略）",
     )
     args = parser.parse_args()
     stem = args.stem
@@ -111,7 +87,9 @@ def main():
         state = json.load(f)
 
     bi = state["current_batch"]
-    start, end = state["batches"][bi]
+    if bi >= len(state["batches"]):
+        print("FATAL: 当前项目已没有待验证批次")
+        sys.exit(2)
     batch_num = bi + 1
 
     # 加载 export 获取预期条目
@@ -119,9 +97,7 @@ def main():
     with open(export_file, encoding="utf-8") as f:
         export_data = json.load(f)
 
-    batch_entries = export_data["entries"][start:end]
-    expected_ids = [str(e["id"]) for e in batch_entries]
-    src_by_id = {str(e["id"]): e.get("source", "") for e in batch_entries}
+    expected_entries = _load_expected_entries(state, export_data, stem)
 
     # 加载 reviewed JSON
     reviewed_path = SCRIPT_DIR / "exports" / stem / f"_batch_{batch_num:03d}_reviewed.json"
@@ -129,32 +105,47 @@ def main():
         print(f"FATAL: reviewed 文件不存在: {reviewed_path}")
         sys.exit(2)
 
-    with open(reviewed_path, encoding="utf-8") as f:
-        data = json.load(f)
-
-    fatal, warnings = _check_batch(expected_ids, src_by_id, data, args.allow_warnings)
-    if fatal:
-        for f in fatal:
-            print(f"FATAL: {f}")
+    try:
+        with open(reviewed_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as exc:
+        print(f"FATAL: reviewed JSON 解析失败: {exc}")
         sys.exit(1)
 
-    if warnings:
+    try:
+        policy = load_validation_policy(
+            args.policy or state.get("validation_policy_path")
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"FATAL: 验证策略无效: {exc}")
+        sys.exit(2)
+
+    report = validate_batch_results(data, expected_entries, policy)
+    if report.fatal:
+        for message in report.fatal:
+            print(f"FATAL: {message}")
+        sys.exit(1)
+
+    if report.warnings:
         print("WARNING:")
-        for w in warnings:
-            print(f"  - {w}")
+        for warning in report.warnings:
+            print(f"  - {warning}")
         if args.allow_warnings:
             print(
-                f"RESULT: PASS (warnings accepted, {len(warnings)} accepted) "
-                f"({len(data)} entries, batch {batch_num}/{state['total_batches']})"
+                f"RESULT: PASS (warnings accepted, {len(report.warnings)} accepted) "
+                f"({len(report.entries)} entries, batch {batch_num}/{state['total_batches']})"
             )
         else:
             print(
-                f"RESULT: PASS with warnings ({len(data)} entries, "
+                f"RESULT: PASS with warnings ({len(report.entries)} entries, "
                 f"batch {batch_num}/{state['total_batches']})"
             )
         sys.exit(0)
 
-    print(f"RESULT: PASS ({len(data)} entries, batch {batch_num}/{state['total_batches']})")
+    print(
+        f"RESULT: PASS ({len(report.entries)} entries, "
+        f"batch {batch_num}/{state['total_batches']})"
+    )
     sys.exit(0)
 
 

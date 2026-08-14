@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from parsers import txt_parser, xlsx_parser
+from parsers import docx_parser, txt_parser, xlsx_parser
 
 
 class TxtParserTest(unittest.TestCase):
@@ -72,6 +72,7 @@ class XlsxParserTest(unittest.TestCase):
             data = xlsx_parser.parse(src, source_col="A", target_col="C", header_row=3)
             self.assertEqual([e["id"] for e in data["entries"]], ["1", "2"])
             self.assertEqual(data["entries"][0]["source"], "セフィロス")
+            self.assertEqual(data["entries"][0]["target"], "旧译文")
             self.assertEqual(data["entries"][0]["_row"], 4)
             self.assertEqual(data["entries"][0]["_target_col"], 2)
 
@@ -106,6 +107,76 @@ class XlsxParserTest(unittest.TestCase):
             ws = openpyxl.load_workbook(out).active
             self.assertEqual(ws.cell(row=4, column=3).value, "萨菲罗斯")
             self.assertEqual(ws.cell(row=5, column=3).value, "蒂法")
+
+    def test_source_column_to_the_right_is_parsed(self):
+        with tempfile.TemporaryDirectory() as td:
+            import openpyxl
+
+            src = Path(td) / "rightmost.xlsx"
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.append(["译文", "", "", "原文"])
+            ws.append(["已有译文", "", "", "日本語"])
+            wb.save(src)
+            data = xlsx_parser.parse(
+                src, source_col="D", target_col="A", header_row=1
+            )
+            self.assertEqual(len(data["entries"]), 1)
+            self.assertEqual(data["entries"][0]["source"], "日本語")
+            self.assertEqual(data["entries"][0]["target"], "已有译文")
+
+    def test_all_sheets_roundtrip(self):
+        with tempfile.TemporaryDirectory() as td:
+            import openpyxl
+
+            src = Path(td) / "multi.xlsx"
+            wb = openpyxl.Workbook()
+            wb.active.title = "One"
+            wb.active.append(["原文", "译文"])
+            wb.active.append(["一", ""])
+            ws2 = wb.create_sheet("Two")
+            ws2.append(["原文", "译文"])
+            ws2.append(["二", ""])
+            wb.save(src)
+
+            data = xlsx_parser.parse(src, sheet_name="*")
+            self.assertEqual([e["_sheet"] for e in data["entries"]], ["One", "Two"])
+            data["entries"][0]["target"] = "甲"
+            data["entries"][1]["target"] = "乙"
+            export = Path(td) / "multi.json"
+            export.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            out = xlsx_parser.write(src, export)
+            result = openpyxl.load_workbook(out, data_only=True)
+            self.assertEqual(result["One"]["B2"].value, "甲")
+            self.assertEqual(result["Two"]["B2"].value, "乙")
+            result.close()
+
+
+class DocxParserTest(unittest.TestCase):
+    def test_write_restores_basic_run_formatting(self):
+        from docx import Document
+
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "format.docx"
+            doc = Document()
+            paragraph = doc.add_paragraph()
+            paragraph.add_run("粗体").bold = True
+            paragraph.add_run("普通")
+            doc.save(src)
+
+            data = docx_parser.parse(src)
+            source = data["entries"][0]["source"]
+            self.assertIn("粗体开始", source)
+            data["entries"][0]["target"] = source.replace("/>粗体<tag", "/>加粗<tag")
+            export = Path(td) / "format.json"
+            export.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            out = docx_parser.write(src, export)
+
+            result = Document(out)
+            runs = result.paragraphs[0].runs
+            self.assertEqual("".join(run.text for run in runs), "加粗普通")
+            self.assertTrue(runs[0].bold)
+            self.assertFalse(bool(runs[-1].bold))
 
 
 if __name__ == "__main__":

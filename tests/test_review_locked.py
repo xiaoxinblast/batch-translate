@@ -39,6 +39,16 @@ class ReviewLockedTest(unittest.TestCase):
         self.assertFalse(review["entries"][0]["locked"])
         self.assertFalse(review["entries"][1]["locked"])
 
+    def test_review_only_preserves_source_lock(self):
+        entries = [
+            {"id": "1", "source": "A", "target": "", "source_locked": True},
+        ]
+        review = batch._build_review_json(
+            entries, _state(), batch_num=1, review_only=True
+        )
+        self.assertTrue(review["entries"][0]["locked"])
+        self.assertTrue(review["entries"][0]["source_locked"])
+
 
 if __name__ == "__main__":
     unittest.main()

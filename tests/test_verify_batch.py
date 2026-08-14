@@ -1,4 +1,4 @@
-"""verify_batch 校验逻辑测试：actor 占位符豁免与人工放行。"""
+"""verify_batch 校验逻辑测试：项目策略例外与人工放行。"""
 
 import contextlib
 import io
@@ -33,13 +33,20 @@ class VerifyBatchTest(unittest.TestCase):
         verify_batch.SCRIPT_DIR = self._old_script_dir
         self.tmp.cleanup()
 
-    def _write_state(self, entries_count: int):
+    def _write_state(self, entries_count: int, policy: dict | None = None):
         state = {
+            "stem": self.STEM,
             "current_batch": 0,
             "total_batches": 1,
             "batches": [[0, entries_count]],
             "export_file": str(self.export_file),
         }
+        if policy is not None:
+            policy_path = self.base / "validation_policy.json"
+            policy_path.write_text(
+                json.dumps(policy, ensure_ascii=False), encoding="utf-8"
+            )
+            state["validation_policy_path"] = str(policy_path)
         (self.data_dir / "batch_state.json").write_text(
             json.dumps(state, ensure_ascii=False), encoding="utf-8"
         )
@@ -56,14 +63,14 @@ class VerifyBatchTest(unittest.TestCase):
                 self.assertEqual(e.code, 0)
         return out.getvalue()
 
-    def test_actor_entry_exempt_from_tag_count(self):
-        """占位符（actor）条目只保留占位符标签时不产生警告。"""
+    def test_project_policy_can_exempt_placeholder_tag_count(self):
+        """项目策略可为指定占位符条目放宽标签比较。"""
         entries = [
             {
                 "id": "1",
                 "source": (
                     "（う……）<tag id='1' type='br' desc='换行'/>"
-                    "<tag id='2' type='fmt' desc='⟨actor⟩'/>"
+                    "<tag id='2' type='fmt' desc='⟨placeholder⟩'/>"
                     "<tag id='3' type='fmt' desc='⟨color=orange⟩'/>"
                 ),
             },
@@ -78,14 +85,18 @@ class VerifyBatchTest(unittest.TestCase):
         self.reviewed.write_text(
             json.dumps(
                 [
-                    {"id": "1", "target": "<tag id='2' type='fmt' desc='⟨actor⟩'/>"},
+                    {"id": "1", "target": "<tag id='2' type='fmt' desc='⟨placeholder⟩'/>"},
                     {"id": "2", "target": "あい"},
                 ],
                 ensure_ascii=False,
             ),
             encoding="utf-8",
         )
-        self._write_state(2)
+        self._write_state(2, {
+            "entry_overrides": {
+                "1": {"tag_mode": "ignore"},
+            }
+        })
 
         out = self._run()
         self.assertNotIn("标签数与 source 不一致", out)
@@ -93,16 +104,13 @@ class VerifyBatchTest(unittest.TestCase):
 
     def test_allow_warnings_flag(self):
         """--allow-warnings 时输出 warnings accepted。"""
-        entries = [
-            {"id": "1", "source": "あ<tag id='1' type='fmt' desc='⟨color=orange⟩'/>い"},
-        ]
+        entries = [{"id": "1", "source": "あ"}]
         self.export_file.write_text(
             json.dumps({"entries": entries}, ensure_ascii=False), encoding="utf-8"
         )
-        self.reviewed.write_text(
-            json.dumps([{"id": "1", "target": "あい"}], ensure_ascii=False),
-            encoding="utf-8",
-        )
+        self.reviewed.write_text(json.dumps({
+            "entries": [{"id": "1", "target": "译文"}],
+        }, ensure_ascii=False), encoding="utf-8")
         self._write_state(1)
 
         out = self._run(allow_warnings=True)

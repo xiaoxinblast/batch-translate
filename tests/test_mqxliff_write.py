@@ -173,6 +173,17 @@ class MqxliffWriteTest(unittest.TestCase):
         self.assertEqual(tm_data["entries"][0]["target"], "大师等级达到250级")
         self.assertEqual(tm_data["entries"][0]["file"], "simple.mqxliff")
 
+    def test_export_marks_source_locked_entry(self):
+        locked = self.td / "locked.mqxliff"
+        locked.write_text("""<?xml version='1.0' encoding='UTF-8'?>
+<xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" xmlns:mq="MQXliff" version="1.2">
+<file><body><trans-unit id="1" mq:locked="locked">
+<source>翻訳禁止</source><target></target>
+</trans-unit></body></file></xliff>""", encoding="utf-8")
+        output = mt.export_to_json(locked, output_dir=self.td / "exports")
+        data = json.loads(output.read_text(encoding="utf-8"))
+        self.assertTrue(data["entries"][0]["source_locked"])
+
 
 if __name__ == "__main__":
     unittest.main()

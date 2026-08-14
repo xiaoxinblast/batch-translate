@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """翻译记忆：JSON 存储 + difflib 模糊检索 + n-gram 片段匹配。"""
 
-import json, re, sys
+import json, os, re, sys, tempfile
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -61,15 +61,34 @@ class TranslationMemory:
         if self._loaded: return self._entries
         if self._path.is_file():
             try:
-                self._entries = json.load(open(self._path, encoding="utf-8")).get("entries", [])
-            except (json.JSONDecodeError, KeyError):
-                self._entries = []
+                with open(self._path, encoding="utf-8") as f:
+                    data = json.load(f)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"TM JSON 损坏，拒绝覆盖: {self._path}: {exc}") from exc
+            if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+                raise ValueError(f"TM JSON 结构无效，拒绝覆盖: {self._path}")
+            self._entries = data["entries"]
         self._loaded = True; self._build_ngram_index()
         return self._entries
 
     def save(self):
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        json.dump({"entries": self._entries}, open(self._path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{self._path.name}.", suffix=".tmp", dir=self._path.parent
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"entries": self._entries}, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_name, self._path)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            Path(temp_name).unlink(missing_ok=True)
+            raise
 
     def add(self, entries: list[dict], dedup: bool = True, replace: bool = False):
         """追加条目；dedup=True 按 (source, context) 去重。

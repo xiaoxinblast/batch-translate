@@ -39,6 +39,7 @@ def cmd_parse(args):
         opts["source_col"] = args.source_col
         opts["target_col"] = args.target_col
         opts["header_row"] = args.header_row
+        opts["sheet_name"] = args.sheet
     if getattr(args, "output_dir", None):
         opts["output_dir"] = args.output_dir
 
@@ -77,6 +78,12 @@ def main():
     p_parse.add_argument("--source-col", type=str, default="A", help="xlsx 源列（默认 A）")
     p_parse.add_argument("--target-col", type=str, default="B", help="xlsx 目标列（默认 B）")
     p_parse.add_argument("--header-row", type=int, default=1, help="xlsx 表头行号（默认 1）")
+    p_parse.add_argument(
+        "--sheet",
+        type=str,
+        default=None,
+        help="xlsx 工作表名称；传 * 处理全部工作表（默认活动表）",
+    )
 
     p_write = sub.add_parser("write", help="译文写回原格式")
     p_write.add_argument("file", type=str, help="原始文件路径")
