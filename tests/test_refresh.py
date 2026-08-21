@@ -6,6 +6,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+
+import openpyxl
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -123,6 +126,15 @@ class RefreshTest(unittest.TestCase):
 
     def test_refresh_after_completion_uses_manifest_tm_layers(self):
         bt = batch._SCRIPT_DIR
+        custom_terms = bt / "data" / "manifest_terms.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["原文(ja)", "译文(zh)", "注释"])
+        ws.append(["こんにちは", "完成态术语", "manifest"])
+        wb.save(custom_terms)
+        wb.close()
+        custom_style = bt / "data" / "manifest_style.txt"
+        custom_style.write_text("完成态风格指南", encoding="utf-8")
         runtime_dir = bt / "data" / self.STEM / "tm_runtime"
         runtime_dir.mkdir(parents=True, exist_ok=True)
         runtime = runtime_dir / "_batch_001.json"
@@ -135,13 +147,42 @@ class RefreshTest(unittest.TestCase):
             "tm_permanent_path": str(bt / "data" / "tm_memory.json"),
             "tm_runtime_dir": str(runtime_dir),
             "tm_runtime_files": [str(runtime)],
+            "terms_path": str(custom_terms),
+            "style_guide_path": str(custom_style),
+            "validation_policy_path": "validation-policy.json",
+            "validation_policy": {"tag_mode": "exact"},
+            "qa_policy_path": "qa-policy.json",
+            "qa_policy": {"rules": {}},
+            "preserved_targets": {"1": "你好"},
+            "reference_selection_path": "reference-selection.json",
+            "require_agent_receipts": True,
+            "source_col": "C",
+            "target_col": "D",
+            "header_row": 3,
+            "sheet_name": "Strings",
         }, ensure_ascii=False), encoding="utf-8")
+        self.addCleanup(custom_terms.unlink, missing_ok=True)
+        self.addCleanup(custom_style.unlink, missing_ok=True)
         self.addCleanup(runtime.unlink, missing_ok=True)
         self.addCleanup(manifest.unlink, missing_ok=True)
 
-        batch.cmd_refresh(None, None, None, None)
+        captured = {}
+        real_enrich = batch._enrich_working_json
+
+        def capture_enrich(path, state):
+            captured.update(state)
+            return real_enrich(path, state)
+
+        with mock.patch.object(batch, "_enrich_working_json", side_effect=capture_enrich):
+            batch.cmd_refresh(None, None, None, None)
         data = json.loads(self._working_path().read_text(encoding="utf-8"))
         self.assertEqual(data["entries"][0]["runtime_tm_matches"][0]["target"], "运行期译文")
+        self.assertEqual(data["entries"][0]["terms"][0]["zh"], "完成态术语")
+        self.assertEqual(data["style_guide"], "完成态风格指南")
+        self.assertEqual(captured["preserved_targets"], {"1": "你好"})
+        self.assertTrue(captured["require_agent_receipts"])
+        self.assertEqual(captured["reference_selection_path"], "reference-selection.json")
+        self.assertEqual(captured["source_col"], "C")
 
 
 if __name__ == "__main__":

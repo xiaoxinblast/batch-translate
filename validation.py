@@ -16,6 +16,7 @@ BARE_TAG_RE = re.compile(r"<(?!tag\b)(/?[a-zA-Z][a-zA-Z0-9]*(?:=[^>]*)?)>")
 
 DEFAULT_POLICY: dict[str, Any] = {
     "ignored_tag_types": ["br"],
+    "forbidden_target_tag_types": [],
     "tag_mode": "exact",
     "enforce_maxlength": True,
     "enforce_newline_count": False,
@@ -26,6 +27,7 @@ DEFAULT_POLICY: dict[str, Any] = {
 _POLICY_KEYS = set(DEFAULT_POLICY)
 _OVERRIDE_KEYS = {
     "ignored_tag_types",
+    "forbidden_target_tag_types",
     "tag_mode",
     "enforce_maxlength",
     "enforce_newline_count",
@@ -49,6 +51,9 @@ def load_validation_policy(path: str | Path | None = None) -> dict[str, Any]:
     policy = {
         **DEFAULT_POLICY,
         "ignored_tag_types": list(DEFAULT_POLICY["ignored_tag_types"]),
+        "forbidden_target_tag_types": list(
+            DEFAULT_POLICY["forbidden_target_tag_types"]
+        ),
         "allow_empty_ids": list(DEFAULT_POLICY["allow_empty_ids"]),
         "entry_overrides": {},
     }
@@ -140,6 +145,18 @@ def validate_batch_results(
         locked = bool(expected.get("locked"))
         source_locked = bool(expected.get("source_locked"))
 
+        preserved = bool(expected.get("preserve_existing")) or source_locked or (
+            locked and bool(baseline)
+        )
+        if preserved:
+            if target != baseline:
+                result.fatal.append(
+                    f"id={entry_id} 为 preserved，target 被修改"
+                )
+            # 既有 target 是只读基线，不以当前项目的标签、换行或长度规则
+            # 反向否定其有效性；格式风险由独立审计报告，不阻断新译提交。
+            continue
+
         if locked and target != baseline:
             result.fatal.append(f"id={entry_id} 为 locked，target 被修改")
 
@@ -154,6 +171,7 @@ def validate_batch_results(
 
         source_tags, source_malformed = _extract_tags(source)
         target_tags, target_malformed = _extract_tags(target)
+        target_tag_types = [tag_type for _, tag_type, _ in target_tags]
         if source_malformed:
             result.fatal.append(f"id={entry_id} 的 source 含无法解析的 <tag> 标记")
         if target_malformed:
@@ -167,6 +185,14 @@ def validate_batch_results(
             result.fatal.append(f"id={entry_id} 的标签序列与 source 不一致")
         elif tag_mode == "count" and len(source_tags) != len(target_tags):
             result.fatal.append(f"id={entry_id} 的标签数量与 source 不一致")
+
+        forbidden = set(entry_policy.get("forbidden_target_tag_types", []))
+        forbidden_found = [tag_type for tag_type in target_tag_types if tag_type in forbidden]
+        if forbidden_found:
+            result.fatal.append(
+                f"id={entry_id} 的 target 含禁止标签类型: "
+                f"{sorted(set(forbidden_found))}"
+            )
 
         if entry_policy.get("enforce_newline_count"):
             if source.count("\n") != target.count("\n"):
@@ -189,6 +215,67 @@ def validate_batch_results(
     return result
 
 
+def audit_preserved_entries(
+    entries: list[dict], policy: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """Report legacy target-format risks without affecting submit eligibility."""
+    policy = policy or load_validation_policy()
+    _validate_policy(policy)
+    findings: list[dict[str, Any]] = []
+    for entry in entries:
+        if not (
+            entry.get("preserve_existing")
+            or entry.get("source_locked")
+            or (entry.get("locked") and bool(entry.get("target", "")))
+        ):
+            continue
+        entry_id = str(entry.get("id", ""))
+        source = entry.get("source", "")
+        target = entry.get("target", "")
+        if not isinstance(source, str) or not isinstance(target, str):
+            findings.append({"id": entry_id, "issue": "source_or_target_not_string"})
+            continue
+        source_tags, source_malformed = _extract_tags(source)
+        target_tags, target_malformed = _extract_tags(target)
+        if source_malformed or target_malformed:
+            findings.append({
+                "id": entry_id,
+                "issue": "malformed_tag",
+                "source_malformed": source_malformed,
+                "target_malformed": target_malformed,
+            })
+            continue
+        entry_policy = effective_entry_policy(policy, entry_id)
+        forbidden = set(entry_policy.get("forbidden_target_tag_types", []))
+        forbidden_found = [
+            tag_type for _, tag_type, _ in target_tags if tag_type in forbidden
+        ]
+        if forbidden_found:
+            findings.append({
+                "id": entry_id,
+                "issue": "forbidden_target_tag_type",
+                "tag_types": sorted(set(forbidden_found)),
+            })
+        ignored = set(entry_policy.get("ignored_tag_types", []))
+        source_tags = [tag for tag in source_tags if tag[1] not in ignored]
+        target_tags = [tag for tag in target_tags if tag[1] not in ignored]
+        tag_mode = entry_policy.get("tag_mode", "exact")
+        mismatched = (
+            tag_mode == "exact" and source_tags != target_tags
+        ) or (
+            tag_mode == "count" and len(source_tags) != len(target_tags)
+        )
+        if mismatched:
+            findings.append({
+                "id": entry_id,
+                "issue": "tag_mismatch",
+                "tag_mode": tag_mode,
+                "source_tags": source_tags,
+                "target_tags": target_tags,
+            })
+    return findings
+
+
 def _extract_tags(text: str) -> tuple[list[tuple[str, str, str]], bool]:
     tags: list[tuple[str, str, str]] = []
     for token in TAG_TOKEN_RE.findall(text):
@@ -207,6 +294,9 @@ def effective_entry_policy(
     entry_id = str(entry_id)
     merged = {
         "ignored_tag_types": list(policy.get("ignored_tag_types", [])),
+        "forbidden_target_tag_types": list(
+            policy.get("forbidden_target_tag_types", [])
+        ),
         "tag_mode": policy.get("tag_mode", "exact"),
         "enforce_maxlength": bool(policy.get("enforce_maxlength", True)),
         "enforce_newline_count": bool(policy.get("enforce_newline_count", False)),
@@ -227,6 +317,11 @@ def _validate_policy(policy: dict[str, Any]) -> None:
         isinstance(value, str) for value in ignored
     ):
         raise ValueError("ignored_tag_types 必须是数组")
+    forbidden = policy.get("forbidden_target_tag_types", [])
+    if not isinstance(forbidden, list) or not all(
+        isinstance(value, str) for value in forbidden
+    ):
+        raise ValueError("forbidden_target_tag_types 必须是数组")
     allow_empty_ids = policy.get("allow_empty_ids", [])
     if not isinstance(allow_empty_ids, list) or not all(
         isinstance(value, (str, int)) and not isinstance(value, bool)
@@ -251,13 +346,15 @@ def _validate_policy(policy: dict[str, Any]) -> None:
             raise ValueError(
                 f"entry_overrides.{entry_id}.tag_mode 必须是 exact、count 或 ignore"
             )
-        if "ignored_tag_types" in override:
-            value = override["ignored_tag_types"]
+        for list_key in ("ignored_tag_types", "forbidden_target_tag_types"):
+            if list_key not in override:
+                continue
+            value = override[list_key]
             if not isinstance(value, list) or not all(
                 isinstance(item, str) for item in value
             ):
                 raise ValueError(
-                    f"entry_overrides.{entry_id}.ignored_tag_types 必须是数组"
+                    f"entry_overrides.{entry_id}.{list_key} 必须是数组"
                 )
         for key in ("enforce_maxlength", "enforce_newline_count", "allow_empty"):
             if key in override and not isinstance(override[key], bool):

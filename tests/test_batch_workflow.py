@@ -215,6 +215,114 @@ class BatchWorkflowTest(unittest.TestCase):
         self.assertEqual(source.read_bytes(), original)
         self.assertTrue(delivered.is_file())
 
+    def test_mixed_existing_target_is_never_written_or_added_to_runtime_tm(self):
+        source = self.base / "mixed.mqxliff"
+        source.write_text(
+            _MINI_MQ.replace(
+                '<target xml:space="preserve"></target>',
+                '<target xml:space="preserve">既有译文</target>',
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        batch.cmd_init(source, batch_chars=100)
+        batch.cmd_next()
+        task = json.loads(
+            (self.tool / "exports" / "mixed" / "_batch_001_to_translate.json")
+            .read_text(encoding="utf-8")
+        )
+        self.assertTrue(task["entries"][0]["preserve_existing"])
+        self.assertTrue(task["entries"][0]["locked"])
+        self._disable_qa("mixed")
+        result = self.base / "mixed-result.json"
+        result.write_text(
+            json.dumps([
+                {"id": "1", "target": "既有译文"},
+                {"id": "2", "target": "新增译文"},
+            ], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        batch.cmd_submit(result)
+
+        runtime = self.tool / "data" / "mixed" / "tm_runtime" / "_batch_001.json"
+        runtime_entries = json.loads(runtime.read_text(encoding="utf-8"))["entries"]
+        self.assertEqual(len(runtime_entries), 1)
+        self.assertEqual(runtime_entries[0]["source"], "二")
+        self.assertEqual(runtime_entries[0]["target"], "新增译文")
+        self.assertEqual(runtime_entries[0]["file"], "_working_mixed.mqxliff")
+
+        delivered = self.base / "mixed-delivered.mqxliff"
+        batch.cmd_export("mixed", str(delivered), False)
+        from mqxliff_tool import parse_mqxliff
+
+        units, _ = parse_mqxliff(delivered)
+        self.assertEqual(next(unit for unit in units if unit.id == "1").target_text, "既有译文")
+        self.assertEqual(next(unit for unit in units if unit.id == "2").target_text, "新增译文")
+
+    def test_restore_preserved_recovers_original_mqxliff_target_and_live_state(self):
+        source = self.base / "restore.mqxliff"
+        source.write_text(
+            _MINI_MQ.replace(
+                '<target xml:space="preserve"></target>',
+                '<target xml:space="preserve">既有译文</target>',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        batch.cmd_init(source)
+        state = self._state("restore")
+        work_file = Path(state["source_file"])
+        work_file.write_text(
+            work_file.read_text(encoding="utf-8").replace("既有译文", "错误译文"),
+            encoding="utf-8",
+        )
+        export_file = Path(state["export_file"])
+        data = json.loads(export_file.read_text(encoding="utf-8"))
+        data["entries"][0]["target"] = "错误译文"
+        export_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+        batch.cmd_restore_preserved("restore")
+
+        from mqxliff_tool import parse_mqxliff
+
+        units, _ = parse_mqxliff(work_file)
+        self.assertEqual(units[0].target_text, "既有译文")
+        restored = json.loads(export_file.read_text(encoding="utf-8"))
+        self.assertEqual(restored["entries"][0]["target"], "既有译文")
+        live_state = self._state("restore")
+        self.assertEqual(live_state["preserved_targets"]["1"], "既有译文")
+        self.assertEqual(live_state["preserved_recovery"]["count"], 1)
+
+    def test_rebuild_runtime_tm_only_includes_submitted_batches_and_updates_state(self):
+        source = self.base / "runtime-rebuild.mqxliff"
+        source.write_text(
+            _MINI_MQ.replace(
+                '<target xml:space="preserve"></target>',
+                '<target xml:space="preserve">既有译文</target>',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        batch.cmd_init(source, batch_chars=1)
+        batch.cmd_next()
+        batch.cmd_submit(
+            self._write_result("runtime-rebuild", 1, {"1": "既有译文"})
+        )
+
+        batch.cmd_rebuild_runtime_tm("runtime-rebuild")
+
+        state = self._state("runtime-rebuild")
+        runtime_dir = self.tool / "data" / "runtime-rebuild" / "tm_runtime"
+        batch_1 = runtime_dir / "_batch_001.json"
+        batch_2 = runtime_dir / "_batch_002.json"
+        self.assertEqual(state["tm_runtime_files"], [str(batch_1.resolve())])
+        self.assertFalse(batch_2.exists())
+        self.assertEqual(
+            json.loads(batch_1.read_text(encoding="utf-8"))["entries"], []
+        )
+        self.assertEqual(state["runtime_tm_rebuild"]["preserved_count"], 1)
+
     def test_policy_allowed_empty_clears_unlocked_mqxliff_target(self):
         source = self.base / "clear.mqxliff"
         source.write_text(
@@ -267,6 +375,56 @@ class BatchWorkflowTest(unittest.TestCase):
         state = self._state("qa_gate")
         self.assertEqual(state["qa_status"], "awaiting_translation")
         self.assertEqual(state["current_batch"], 0)
+
+    def test_required_translator_receipt_blocks_review_until_recorded(self):
+        source = self.base / "receipt.txt"
+        source.write_text("原文\n", encoding="utf-8")
+        selection = self.base / "reference-selection.json"
+        selection.write_text(json.dumps({
+            "approved": True,
+            "style_guide": None,
+            "terms": None,
+            "tm_permanent": None,
+            "validation_policy": None,
+            "qa_policy": None,
+        }), encoding="utf-8")
+        role = self.base / "translator.toml"
+        role.write_text(
+            'name = "translator"\nmodel = "gpt-5.6-terra"\n'
+            'model_reasoning_effort = "max"\n',
+            encoding="utf-8",
+        )
+
+        batch.cmd_init(
+            source,
+            require_agent_receipts=True,
+            reference_selection_path=selection,
+        )
+        batch.cmd_next()
+        task = self.tool / "exports" / "receipt" / "_batch_001_to_translate.json"
+        result = self.base / "receipt-result.json"
+        result.write_text(
+            json.dumps([{"id": "1", "target": "译文"}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        with self.assertRaises(SystemExit):
+            batch.cmd_review(result, "receipt")
+
+        wrong_role = self.base / "wrong-translator.toml"
+        wrong_role.write_text(
+            'name = "translator"\nmodel = "gpt-5.6-luna"\n'
+            'model_reasoning_effort = "max"\n',
+            encoding="utf-8",
+        )
+        with self.assertRaises(SystemExit):
+            batch.cmd_receipt(
+                "translator", "/root/translator_wrong", wrong_role, task, result, "receipt"
+            )
+
+        batch.cmd_receipt(
+            "translator", "/root/translator_001", role, task, result, "receipt"
+        )
+        batch.cmd_review(result, "receipt")
 
     def test_clean_qa_rejects_changed_reviewed_baseline(self):
         source = self.base / "qa_clean.txt"
@@ -511,6 +669,23 @@ class BatchWorkflowTest(unittest.TestCase):
 
         self.assertEqual(merge["mode"], "context_merge")
         self.assertEqual(len(merge["part_reports"]), 3)
+
+    def test_context_split_projects_only_analysis_fields(self):
+        source = self.base / "context-fields.txt"
+        source.write_text("一\n二\n", encoding="utf-8")
+        batch.cmd_init(source)
+        export_file = self.tool / "exports" / "context-fields" / "_working.json"
+        data = json.loads(export_file.read_text(encoding="utf-8"))
+        data["entries"][0]["tm_matches"] = [{"source": "噪声", "target": "noise"}]
+        data["entries"][0]["terms"] = [{"source": "噪声", "target": "noise"}]
+        export_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+        manifest_path = batch.cmd_context_split(100, "context-fields")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        part = json.loads(Path(manifest["parts"][0]["path"]).read_text(encoding="utf-8"))
+        self.assertNotIn("tm_matches", part["entries"][0])
+        self.assertNotIn("terms", part["entries"][0])
+        self.assertEqual(part["entries"][0]["source"], "一")
 
     def test_init_refuses_to_overwrite_existing_state(self):
         source = self.base / "existing.txt"

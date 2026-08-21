@@ -104,6 +104,12 @@ class BatchCommandsTest(unittest.TestCase):
         sidecar = batch._SCRIPT_DIR / "exports" / self.STEM / "document_summary.md"
         self.assertEqual(sidecar.read_text(encoding="utf-8"), "仅 sidecar")
 
+    def test_summary_rejects_overlong_report(self):
+        self._ensure_state()
+        report = self._report("x" * 5501)
+        with self.assertRaises(SystemExit):
+            batch.cmd_summary(report, None)
+
     def test_export_copies_to_delivered_default(self):
         dst = Path(self._tmp.name) / "已交付" / f"{self.STEM}.mqxliff"
         if dst.exists():
@@ -162,6 +168,57 @@ class BatchCommandsTest(unittest.TestCase):
             batch_file.unlink()
         with self.assertRaises(SystemExit):
             batch.cmd_term_gaps(None, None)
+
+    def test_tag_audit_reports_preserved_format_risk_without_mutating_data(self):
+        project = "audit"
+        project_dir = batch._SCRIPT_DIR / "data" / project
+        export_dir = batch._SCRIPT_DIR / "exports" / project
+        project_dir.mkdir()
+        export_dir.mkdir()
+        actor = "<tag id='2' type='fmt' desc='⟨actor⟩'/>"
+        br = "<tag id='1' type='br' desc='换行'/>"
+        export_file = export_dir / "_working.json"
+        export_file.write_text(
+            json.dumps({"entries": [{
+                "id": "1", "source": actor, "target": br,
+            }]}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        state_path = project_dir / "batch_state.json"
+        state_path.write_text(
+            json.dumps({
+                "project_id": project,
+                "stem": project,
+                "export_file": str(export_file),
+                "preserved_targets": {"1": br},
+                "validation_policy": {
+                    "ignored_tag_types": ["br"],
+                    "forbidden_target_tag_types": [],
+                    "tag_mode": "exact",
+                    "enforce_maxlength": True,
+                    "enforce_newline_count": False,
+                    "allow_empty_ids": [],
+                    "entry_overrides": {
+                        "1": {"forbidden_target_tag_types": ["br"]},
+                    },
+                },
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        before = {
+            export_file: export_file.read_bytes(),
+            state_path: state_path.read_bytes(),
+        }
+        out = Path(self._tmp.name) / "_temp" / "tag-audit.md"
+
+        batch.cmd_tag_audit(project, str(out))
+
+        report = out.read_text(encoding="utf-8")
+        self.assertIn("forbidden_target_tag_type", report)
+        self.assertIn("tag_mismatch", report)
+        self.assertEqual(
+            {path: path.read_bytes() for path in before}, before
+        )
 
 
 if __name__ == "__main__":

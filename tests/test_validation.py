@@ -34,7 +34,28 @@ class ValidationTest(unittest.TestCase):
         report = validate_batch_results(
             [{"id": "1", "target": "被修改"}], expected
         )
-        self.assertTrue(any("locked" in message for message in report.fatal))
+        self.assertTrue(any("preserved" in message for message in report.fatal))
+
+    def test_preserved_target_skips_format_checks_but_cannot_change(self):
+        source_tag = "<tag id='1' type='fmt' desc='源格式'/>"
+        legacy_tag = "<tag id='9' type='fmt' desc='旧格式'/>"
+        expected = [{
+            "id": "1",
+            "source": f"原{source_tag}文",
+            "translated": f"旧{legacy_tag}译文",
+            "locked": True,
+            "preserve_existing": True,
+        }]
+
+        unchanged = validate_batch_results(
+            [{"id": "1", "target": f"旧{legacy_tag}译文"}], expected
+        )
+        self.assertTrue(unchanged.ok, unchanged.fatal)
+
+        changed = validate_batch_results(
+            [{"id": "1", "target": f"改{legacy_tag}译文"}], expected
+        )
+        self.assertTrue(any("preserved" in message for message in changed.fatal))
 
     def test_source_locked_empty_target_is_allowed(self):
         expected = [{
@@ -82,6 +103,33 @@ class ValidationTest(unittest.TestCase):
         )
         self.assertTrue(any("id=1" in message for message in report.fatal))
         self.assertFalse(any("id=2" in message for message in report.fatal))
+
+    def test_project_policy_can_retain_actor_while_forbidding_target_br(self):
+        br = "<tag id='1' type='br' desc='换行'/>"
+        actor = "<tag id='2' type='fmt' desc='⟨actor⟩'/>"
+        expected = [{"id": "1", "source": f"原{br}{actor}{br}文"}]
+        policy = load_validation_policy()
+        policy["entry_overrides"] = {
+            "1": {
+                "tag_mode": "exact",
+                "forbidden_target_tag_types": ["br"],
+            }
+        }
+
+        valid = validate_batch_results(
+            [{"id": "1", "target": f"译{actor}文"}], expected, policy
+        )
+        self.assertTrue(valid.ok, valid.fatal)
+
+        missing_actor = validate_batch_results(
+            [{"id": "1", "target": "译文"}], expected, policy
+        )
+        self.assertTrue(any("标签序列" in message for message in missing_actor.fatal))
+
+        extra_br = validate_batch_results(
+            [{"id": "1", "target": f"译{actor}{br}文"}], expected, policy
+        )
+        self.assertTrue(any("禁止标签类型" in message for message in extra_br.fatal))
 
     def test_effective_entry_policy_includes_global_empty_allowance(self):
         policy = load_validation_policy()

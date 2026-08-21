@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from validation import (
+    audit_preserved_entries,
     effective_entry_policy,
     load_validation_policy,
     validate_batch_results,
@@ -107,9 +108,9 @@ def _normalize_source_path(path: str | Path) -> str:
 
 def _read_project_record(project_id: str) -> dict:
     paths = (
-        _project_identity_path(project_id),
         _project_state_path(project_id),
         _SCRIPT_DIR / "exports" / project_id / "project_manifest.json",
+        _project_identity_path(project_id),
     )
     for path in paths:
         if not path.is_file():
@@ -122,6 +123,15 @@ def _read_project_record(project_id: str) -> dict:
         if isinstance(record, dict):
             return record
     return {}
+
+
+def _write_project_record(project_id: str, record: dict) -> None:
+    """Persist maintenance metadata to the live state and/or completion manifest."""
+    state_path = _project_state_path(project_id)
+    if state_path.is_file():
+        _write_json_atomic(state_path, record)
+    manifest_path = _SCRIPT_DIR / "exports" / project_id / "project_manifest.json"
+    _write_json_atomic(manifest_path, record)
 
 
 def _project_occupied(project_id: str) -> bool:
@@ -224,6 +234,114 @@ def _sha256_file(path: Path) -> str | None:
     return digest.hexdigest()
 
 
+def _receipt_path(state: dict, stage: str) -> Path:
+    batch_num = state.get("current_batch", 0) + 1
+    return (
+        _SCRIPT_DIR / "exports" / state["stem"] / "receipts"
+        / f"_batch_{batch_num:03d}_{stage}.json"
+    )
+
+
+def _read_role_config(path: Path) -> dict[str, str]:
+    """Read the three role identity fields without adding a TOML dependency."""
+    text = path.read_text(encoding="utf-8")
+    fields = {}
+    for key in ("name", "model", "model_reasoning_effort"):
+        match = re.search(rf'^\s*{re.escape(key)}\s*=\s*"([^"]+)"', text, re.M)
+        if not match:
+            raise ValueError(f"角色配置缺少 {key}: {path}")
+        fields[key] = match.group(1)
+    return fields
+
+
+_ROLE_MODEL_CONTRACT = {
+    "context-analyzer": ("gpt-5.6-luna", "max"),
+    "translator": ("gpt-5.6-terra", "max"),
+    "trans-reviewer": ("gpt-5.6-terra", "max"),
+    "qa-reviewer": ("gpt-5.6-luna", "max"),
+}
+
+
+def cmd_receipt(
+    stage: str,
+    agent_id: str,
+    role_config: Path,
+    input_path: Path,
+    output_path: Path,
+    project_arg: Optional[str] = None,
+):
+    """Record a verifiable role-output receipt for an agentic pipeline stage."""
+    allowed_stages = {"context-analyzer", "translator", "trans-reviewer", "qa-reviewer"}
+    if stage not in allowed_stages:
+        print(f"❌ 未知 receipt stage: {stage}")
+        sys.exit(1)
+    if not str(agent_id).strip():
+        print("❌ receipt 必须提供非空 agent_id")
+        sys.exit(1)
+    for label, path in (("角色配置", role_config), ("输入", input_path), ("输出", output_path)):
+        if not path.is_file():
+            print(f"❌ receipt {label}文件不存在: {path}")
+            sys.exit(1)
+    try:
+        config = _read_role_config(role_config)
+    except (OSError, ValueError) as exc:
+        print(f"❌ receipt 角色配置无效: {exc}")
+        sys.exit(1)
+    if config["name"] != stage:
+        print(f"❌ receipt stage 与角色配置不一致: {stage} != {config['name']}")
+        sys.exit(1)
+    expected_model, expected_effort = _ROLE_MODEL_CONTRACT[stage]
+    if (
+        config["model"] != expected_model
+        or config["model_reasoning_effort"] != expected_effort
+    ):
+        print(
+            f"❌ receipt 角色模型不符合工作流契约: {stage} 必须使用 "
+            f"{expected_model} / {expected_effort}"
+        )
+        sys.exit(1)
+    state = _load_state(project_arg)
+    receipt = {
+        "schema_version": 1,
+        "stage": stage,
+        "batch": state.get("current_batch", 0) + 1,
+        "agent_id": str(agent_id),
+        "role_config": str(role_config.resolve()),
+        "role_config_sha256": _sha256_file(role_config),
+        "model": config["model"],
+        "model_reasoning_effort": config["model_reasoning_effort"],
+        "input": str(input_path.resolve()),
+        "input_sha256": _sha256_file(input_path),
+        "output": str(output_path.resolve()),
+        "output_sha256": _sha256_file(output_path),
+    }
+    path = _receipt_path(state, stage)
+    _write_json_atomic(path, receipt)
+    print(f"✅ 已记录 {stage} receipt: {path}")
+
+
+def _require_agent_receipt(state: dict, stage: str, output_path: Path) -> None:
+    if not state.get("require_agent_receipts"):
+        return
+    receipt_path = _receipt_path(state, stage)
+    if not receipt_path.is_file():
+        print(f"❌ 缺少 {stage} receipt，不能推进: {receipt_path}")
+        sys.exit(1)
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"❌ {stage} receipt 无效: {exc}")
+        sys.exit(1)
+    if (
+        receipt.get("stage") != stage
+        or receipt.get("batch") != state.get("current_batch", 0) + 1
+        or receipt.get("output") != str(output_path.resolve())
+        or receipt.get("output_sha256") != _sha256_file(output_path)
+    ):
+        print(f"❌ {stage} receipt 与当前输出不一致，不能推进")
+        sys.exit(1)
+
+
 def _project_rules_dir(project_id: str) -> Path:
     return _SCRIPT_DIR / "data" / project_id / "project_rules"
 
@@ -266,6 +384,35 @@ def _write_project_policy_snapshots(
         "qa_policy_path": str(qa_path.resolve()),
         "policy_manifest_path": str(manifest_path.resolve()),
     }
+
+
+def _validate_reference_selection(
+    path: Path, expected_paths: dict[str, Optional[Path]]
+) -> dict:
+    """Verify the user-approved source selection before initialization."""
+    if not path.is_file():
+        raise FileNotFoundError(f"参考资料确认文件不存在: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        selection = json.load(f)
+    if not isinstance(selection, dict) or selection.get("approved") is not True:
+        raise ValueError("参考资料确认文件必须是 approved=true 的 JSON 对象")
+    for key, expected_path in expected_paths.items():
+        value = selection.get(key)
+        if expected_path is None:
+            if value is not None:
+                raise ValueError(f"参考资料确认 {key} 必须为 null")
+            continue
+        if not isinstance(value, dict):
+            raise ValueError(f"参考资料确认缺少 {key}")
+        recorded_path = value.get("path")
+        if not isinstance(recorded_path, str) or (
+            _normalize_source_path(recorded_path)
+            != _normalize_source_path(expected_path)
+        ):
+            raise ValueError(f"参考资料确认 {key} 路径与 init 参数不一致")
+        if value.get("sha256") != _sha256_file(expected_path):
+            raise ValueError(f"参考资料确认 {key} SHA-256 与当前文件不一致")
+    return selection
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -342,6 +489,27 @@ def _tm_permanent_path(state: dict) -> Optional[Path]:
 def _tm_batch_number(path: Path) -> Optional[int]:
     match = re.search(r"_batch_(\d+)\.json$", path.name)
     return int(match.group(1)) if match else None
+
+
+def _entry_baseline(entry: dict) -> str:
+    """Return the target value an immutable task entry must retain."""
+    value = entry.get("translated", entry.get("target", ""))
+    return value if isinstance(value, str) else ""
+
+
+def _is_preserved_entry(entry: dict) -> bool:
+    """Identify a target that must remain outside all write paths."""
+    if entry.get("preserve_existing") or entry.get("source_locked"):
+        return True
+    return bool(entry.get("locked")) and bool(_entry_baseline(entry))
+
+
+def _preserved_entry_ids(entries: list[dict]) -> set[str]:
+    return {
+        str(entry.get("id"))
+        for entry in entries
+        if _is_preserved_entry(entry)
+    }
 
 
 def _tm_entry_from_export(entry: dict, source_file: str) -> Optional[dict]:
@@ -618,6 +786,10 @@ def _build_review_json(
         if e.get("source_locked"):
             item["source_locked"] = True
             item["locked"] = True
+            item["preserve_existing"] = True
+        elif e.get("preserve_existing"):
+            item["locked"] = True
+            item["preserve_existing"] = True
         elif review_only:
             # review 模式：已有译文是待校对对象，不标记为锁定
             item["locked"] = False
@@ -670,6 +842,8 @@ def cmd_init(
     force_reinit: bool = False,
     tm_permanent_path: Optional[Path] = None,
     tm_runtime_dir: Optional[Path] = None,
+    require_agent_receipts: bool = False,
+    reference_selection_path: Optional[Path] = None,
 ) -> str:
     """初始化批量翻译：解析源文件 → 中间 JSON，写入 state。"""
     source_path = source_path.resolve()
@@ -688,6 +862,25 @@ def cmd_init(
             print("❌ --tm 与 --tm-permanent 指向不同文件，请只指定一个永久 TM")
             sys.exit(1)
     permanent_tm_path = tm_permanent_path or tm_path
+    reference_selection = None
+    if require_agent_receipts:
+        if reference_selection_path is None:
+            print("❌ --require-agent-receipts 时必须提供 --reference-selection")
+            sys.exit(1)
+        try:
+            reference_selection = _validate_reference_selection(
+                reference_selection_path,
+                {
+                    "style_guide": style_guide_path,
+                    "terms": terms_path,
+                    "tm_permanent": permanent_tm_path,
+                    "validation_policy": validation_policy_path,
+                    "qa_policy": qa_policy_path,
+                },
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"❌ 参考资料确认无效: {exc}")
+            sys.exit(1)
 
     try:
         project_id = _choose_project_id(
@@ -744,6 +937,12 @@ def cmd_init(
         validation_policy_path,
         qa_policy_path,
     )
+    reference_selection_snapshot = None
+    if reference_selection is not None:
+        reference_selection_snapshot = (
+            _project_rules_dir(project_id) / "reference_selection.json"
+        )
+        _write_json_atomic(reference_selection_snapshot, reference_selection)
 
     # 复制源文件到工作文件（不动源文件）
     import shutil
@@ -784,6 +983,12 @@ def cmd_init(
     if total == 0:
         print("❌ 源文件中没有可翻译条目，未创建批次状态")
         sys.exit(1)
+    preserved_targets = {
+        str(entry["id"]): entry.get("target", "")
+        for entry in entries
+        if entry.get("source_locked")
+        or bool(_entry_baseline(entry).strip())
+    }
 
     # 按字数分批
     import re
@@ -832,13 +1037,20 @@ def cmd_init(
         "tm_permanent_path": str(permanent_tm_path.resolve()) if permanent_tm_path else None,
         "tm_runtime_dir": str(runtime_dir),
         "tm_runtime_files": [],
+        "preserved_targets": preserved_targets,
         "style_guide_path": str(style_guide_path.resolve()) if style_guide_path else None,
         "validation_policy_path": policy_snapshots["validation_policy_path"],
         "validation_policy": validation_policy,
         "qa_policy_path": policy_snapshots["qa_policy_path"],
         "qa_policy": qa_policy,
         "policy_manifest_path": policy_snapshots["policy_manifest_path"],
+        "reference_selection_path": (
+            str(reference_selection_snapshot.resolve())
+            if reference_selection_snapshot is not None
+            else None
+        ),
         "qa_required": True,
+        "require_agent_receipts": require_agent_receipts,
         "qa_status": "not_started",
         "source_col": source_col,
         "target_col": target_col,
@@ -976,13 +1188,14 @@ def cmd_next(review_only: bool = False, project_arg: Optional[str] = None):
         return
 
     # ── 翻译模式 ──
-    # 构建批次条目：已有译文的条目注入为 locked，空条目正常翻译
+    # 构建批次条目：已有译文作为只读基线，空条目正常翻译。
     batch_entries = []
     locked_count = 0
     existing_locked_count = 0
     source_locked_count = 0
     for e in entries[start:end]:
-        existing_target = e.get("target", "").strip()
+        existing_target = _entry_baseline(e)
+        has_existing_target = bool(existing_target.strip())
         item = {
             "id": e["id"],
             "source": e["source"],
@@ -1012,13 +1225,15 @@ def cmd_next(review_only: bool = False, project_arg: Optional[str] = None):
         if e.get("source_locked"):
             item["target"] = existing_target
             item["locked"] = True
+            item["preserve_existing"] = True
             item["note"] = (item.get("note", "") + " 【源文件锁定，严禁修改】").strip()
             locked_count += 1
             source_locked_count += 1
-        elif existing_target:
+        elif has_existing_target:
             item["target"] = existing_target
             item["locked"] = True
-            item["note"] = (item.get("note", "") + " 【已有100%匹配译文，严禁修改】").strip()
+            item["preserve_existing"] = True
+            item["note"] = (item.get("note", "") + " 【已有译文为只读基线，严禁修改或写回】").strip()
             locked_count += 1
             existing_locked_count += 1
         else:
@@ -1109,10 +1324,14 @@ def _load_expected_batch_entries(state: dict, export_data: dict) -> list[dict]:
                 return task["entries"]
 
     start, end = state["batches"][batch_index]
+    preserved_targets = state.get("preserved_targets", {})
     expected = []
     for source_entry in export_data["entries"][start:end]:
         entry = dict(source_entry)
         entry["locked"] = bool(source_entry.get("source_locked"))
+        if str(entry.get("id")) in preserved_targets:
+            entry["preserve_existing"] = True
+            entry["target"] = preserved_targets[str(entry["id"])]
         expected.append(entry)
     return expected
 
@@ -1224,17 +1443,28 @@ def cmd_submit(
         })
 
     result_map = {str(r["id"]): r["target"] for r in results}
-    print(f"📥 读取到 {len(result_map)} 条翻译")
 
     # 先在内存合并；批外 id 已由共享校验器拒绝。
     export_file = Path(state["export_file"])
     with open(export_file, "r", encoding="utf-8") as f:
         data = json.load(f)
+    expected_entries = _load_expected_batch_entries(state, data)
+    preserved_ids = _preserved_entry_ids(expected_entries)
+    writable_result_map = {
+        entry_id: target
+        for entry_id, target in result_map.items()
+        if entry_id not in preserved_ids
+    }
+    print(
+        f"📥 读取到 {len(result_map)} 条结果；"
+        f"{len(preserved_ids)} 条保留基线不写回，"
+        f"{len(writable_result_map)} 条可写入"
+    )
 
     merged = 0
     for e in data["entries"]:
-        if e["id"] in result_map:
-            e["target"] = result_map[e["id"]]
+        if e["id"] in writable_result_map:
+            e["target"] = writable_result_map[e["id"]]
             merged += 1
 
     import subprocess
@@ -1277,24 +1507,27 @@ def cmd_submit(
                 }
                 submitted_data["entries"] = [
                     entry for entry in data["entries"]
-                    if entry["id"] in result_map
+                    if entry["id"] in writable_result_map
                 ]
                 _write_json_atomic(submitted_file, submitted_data)
-                import_args = [
-                    sys.executable,
-                    str(_SCRIPT_DIR / "mqxliff_tool.py"),
-                    "import",
-                    str(submitted_file),
-                    str(work_file),
-                    "--output",
-                    str(candidate_work),
-                ]
-                subprocess.run(import_args, check=True)
+                if writable_result_map:
+                    import_args = [
+                        sys.executable,
+                        str(_SCRIPT_DIR / "mqxliff_tool.py"),
+                        "import",
+                        str(submitted_file),
+                        str(work_file),
+                        "--output",
+                        str(candidate_work),
+                    ]
+                    subprocess.run(import_args, check=True)
+                else:
+                    shutil.copy2(work_file, candidate_work)
 
                 _write_runtime_tm(
                     merged_file,
                     runtime_file,
-                    set(result_map),
+                    set(writable_result_map),
                 )
 
                 if state.get("existing_targets") == state["total"]:
@@ -1315,7 +1548,7 @@ def cmd_submit(
                 _write_runtime_tm(
                     merged_file,
                     runtime_file,
-                    set(result_map),
+                    set(writable_result_map),
                 )
                 _enrich_working_json(merged_file, state)
                 os.replace(merged_file, export_file)
@@ -1420,6 +1653,7 @@ def cmd_review(result_path: Path, project_arg: Optional[str] = None):
     if not result_path.is_file():
         print(f"❌ 结果文件不存在: {result_path}")
         sys.exit(1)
+    _require_agent_receipt(state, "translator", result_path)
     with open(result_path, "r", encoding="utf-8") as f:
         results = json.load(f)
 
@@ -1520,6 +1754,7 @@ def cmd_qa(project_arg: Optional[str] = None):
         print("⚠️ reviewed 基线已变化，丢弃旧 QA 任务并重新运行 QA")
 
     raw_results = _load_json_file(reviewed_path, "reviewed 文件")
+    _require_agent_receipt(state, "trans-reviewer", reviewed_path)
     results, warnings = _validate_submission(raw_results, state)
     if warnings:
         print("❌ reviewed 文件含 warning，QA 前必须先处理")
@@ -1639,6 +1874,7 @@ def cmd_qa_submit(
     ):
         print("❌ QA 输出文件路径与 QA task 不一致，请按 task 中的绝对路径写入")
         sys.exit(1)
+    _require_agent_receipt(state, "qa-reviewer", result_path)
     report = _load_json_file(report_path, "QA 报告")
     raw_baseline = _load_json_file(reviewed_path, "reviewed 文件")
     baseline_results, baseline_warnings = _validate_submission(raw_baseline, state)
@@ -1745,18 +1981,30 @@ def cmd_retry(project_arg: Optional[str] = None):
     cmd_next(project_arg=state.get("project_id") or state["stem"])
 
 
-def cmd_summary(report_file: Path, stem_arg: Optional[str]):
+def cmd_summary(
+    report_file: Path, stem_arg: Optional[str], max_chars: int = 5500
+):
     """把语境分析报告写入 batch_state.json 的 document_summary，并保留 sidecar。"""
     if not report_file.is_file():
         print(f"❌ 报告文件不存在: {report_file}")
         sys.exit(1)
     stem = _resolve_stem(stem_arg)
     text = report_file.read_text(encoding="utf-8")
+    if max_chars <= 0:
+        print("❌ max_chars 必须大于 0")
+        sys.exit(1)
+    if len(text) > max_chars:
+        print(
+            f"❌ 语境报告过长: {len(text)} > {max_chars} 字符；"
+            "请保留必要 id 关系后压缩报告再提交"
+        )
+        sys.exit(1)
 
     state_path = _SCRIPT_DIR / "data" / stem / "batch_state.json"
     if state_path.is_file():
         with open(state_path, "r", encoding="utf-8") as f:
             state = json.load(f)
+        _require_agent_receipt(state, "context-analyzer", report_file)
         state["document_summary"] = text
         with open(state_path, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
@@ -1796,12 +2044,21 @@ def cmd_refresh(
         enrich_state = {
             "project_id": state.get("project_id") or state.get("stem") or stem,
             "stem": state.get("stem") or stem,
-            "terms_path": state.get("terms_path"),
+            "terms_path": str(Path(terms_arg).resolve()) if terms_arg
+                          else state.get("terms_path"),
             "tm_path": permanent_override or state.get("tm_path"),
             "tm_permanent_path": permanent_override or state.get("tm_permanent_path") or state.get("tm_path"),
             "tm_runtime_dir": state.get("tm_runtime_dir"),
             "tm_runtime_files": state.get("tm_runtime_files", []),
-            "style_guide_path": state.get("style_guide_path"),
+            "style_guide_path": str(Path(style_guide_arg).resolve()) if style_guide_arg
+                                else state.get("style_guide_path"),
+            "validation_policy_path": state.get("validation_policy_path"),
+            "validation_policy": state.get("validation_policy"),
+            "qa_policy_path": state.get("qa_policy_path"),
+            "qa_policy": state.get("qa_policy"),
+            "preserved_targets": state.get("preserved_targets", {}),
+            "reference_selection_path": state.get("reference_selection_path"),
+            "require_agent_receipts": bool(state.get("require_agent_receipts")),
             "source_col": state.get("source_col", "A"),
             "target_col": state.get("target_col", "B"),
             "header_row": state.get("header_row", 1),
@@ -1834,17 +2091,26 @@ def cmd_refresh(
             "project_id": stem,
             "stem": stem,
             "terms_path": str(Path(terms_arg).resolve()) if terms_arg
-                         else str(_SCRIPT_DIR / "data" / "term_base.xlsx"),
+                         else manifest.get("terms_path")
+                         or str(_SCRIPT_DIR / "data" / "term_base.xlsx"),
             "tm_path": str(Path(permanent_tm).resolve()) if permanent_tm else None,
             "tm_permanent_path": str(Path(permanent_tm).resolve()) if permanent_tm else None,
             "tm_runtime_dir": str(Path(runtime_dir).resolve()),
             "tm_runtime_files": manifest.get("tm_runtime_files", []),
             "style_guide_path": str(Path(style_guide_arg).resolve()) if style_guide_arg
-                                else str(_SCRIPT_DIR / "data" / "style_guide.txt"),
-            "source_col": "A",
-            "target_col": "B",
-            "header_row": 1,
-            "sheet_name": None,
+                                else manifest.get("style_guide_path")
+                                or str(_SCRIPT_DIR / "data" / "style_guide.txt"),
+            "validation_policy_path": manifest.get("validation_policy_path"),
+            "validation_policy": manifest.get("validation_policy"),
+            "qa_policy_path": manifest.get("qa_policy_path"),
+            "qa_policy": manifest.get("qa_policy"),
+            "preserved_targets": manifest.get("preserved_targets", {}),
+            "reference_selection_path": manifest.get("reference_selection_path"),
+            "require_agent_receipts": bool(manifest.get("require_agent_receipts")),
+            "source_col": manifest.get("source_col", "A"),
+            "target_col": manifest.get("target_col", "B"),
+            "header_row": manifest.get("header_row", 1),
+            "sheet_name": manifest.get("sheet_name"),
         }
 
     if not work_file.is_file():
@@ -1920,10 +2186,9 @@ def cmd_export(stem_arg: Optional[str], out_arg: Optional[str], force: bool):
         temp_dir = Path(temp_name)
         candidate = temp_dir / f"candidate{work_file.suffix}"
         if work_file.suffix.lower() == ".mqxliff":
-            subprocess.run([
-                sys.executable, str(_SCRIPT_DIR / "mqxliff_tool.py"), "import",
-                str(export_file), str(work_file), "--output", str(candidate),
-            ], check=True)
+            # 每批提交已只导入可写 ID；最终导出直接复制工作副本，避免
+            # 将 mixed 模式的既有 target 再次重建或序列化。
+            shutil.copy2(work_file, candidate)
             try:
                 sys.path.insert(0, str(_SCRIPT_DIR))
                 from mqxliff_tool import parse_mqxliff
@@ -1947,9 +2212,18 @@ def cmd_export(stem_arg: Optional[str], out_arg: Optional[str], force: bool):
                 print(f"❌ 导出校验失败（文件可能损坏）: {exc}")
                 sys.exit(1)
         else:
+            preserved_ids = set(record.get("preserved_targets", {}))
+            with open(export_file, "r", encoding="utf-8") as f:
+                writable_data = json.load(f)
+            writable_data["entries"] = [
+                entry for entry in writable_data.get("entries", [])
+                if str(entry.get("id")) not in preserved_ids
+            ]
+            writable_file = temp_dir / "writable_entries.json"
+            _write_json_atomic(writable_file, writable_data)
             subprocess.run([
                 sys.executable, str(_SCRIPT_DIR / "convert.py"), "write",
-                str(work_file), str(export_file), "--output", str(candidate),
+                str(work_file), str(writable_file), "--output", str(candidate),
             ], check=True)
             parsed_file = temp_dir / "parsed.json"
             subprocess.run(
@@ -2026,6 +2300,252 @@ def cmd_term_gaps(stem_arg: Optional[str], out_arg: Optional[str]):
     print(f"✅ 术语缺口清单已生成: {out}")
 
 
+def cmd_tag_audit(project_arg: Optional[str], out_arg: Optional[str]) -> Path:
+    """Inspect preserved targets without changing files or blocking workflow."""
+    project_id = _resolve_project_id(project_arg)
+    record = _read_project_record(project_id)
+    preserved_targets = record.get("preserved_targets", {})
+    if not isinstance(preserved_targets, dict):
+        print("❌ 项目未记录 preserved target 基线，无法执行标签审计")
+        sys.exit(1)
+    export_file = Path(record.get("export_file", ""))
+    if not export_file.is_file():
+        print(f"❌ 工作 JSON 不存在: {export_file}")
+        sys.exit(1)
+    try:
+        policy = record.get("validation_policy") or load_validation_policy(
+            record.get("validation_policy_path")
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"❌ 验证策略无效: {exc}")
+        sys.exit(1)
+    with open(export_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    entries = []
+    for entry in data.get("entries", []):
+        entry_id = str(entry.get("id"))
+        if entry_id not in preserved_targets:
+            continue
+        item = dict(entry)
+        item["target"] = preserved_targets[entry_id]
+        item["preserve_existing"] = True
+        entries.append(item)
+    findings = audit_preserved_entries(entries, policy)
+    if out_arg:
+        out = Path(out_arg)
+    else:
+        out = _SCRIPT_DIR.parent / "_temp" / f"tag_audit_{project_id}.md"
+    lines = [
+        f"# 既有译文标签审计（{project_id}）",
+        "",
+        f"保留条目：{len(entries)} 条",
+        f"风险条目：{len(findings)} 条",
+        "",
+    ]
+    if findings:
+        for finding in findings:
+            lines.append(f"- id={finding['id']} | {finding['issue']}")
+    else:
+        lines.append("无")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"✅ 标签审计完成（不阻断、不写回）: {out}")
+    return out
+
+
+def cmd_restore_preserved(project_arg: Optional[str]) -> None:
+    """Repair a legacy MQXLIFF project from its original existing targets."""
+    project_id = _resolve_project_id(project_arg)
+    record = _read_project_record(project_id)
+    if record.get("source_format") != "mqxliff":
+        print("❌ restore-preserved 仅支持 MQXLIFF 项目")
+        sys.exit(1)
+    original = Path(record.get("input_source_file", ""))
+    work_file = Path(record.get("source_file", ""))
+    export_file = Path(record.get("export_file", ""))
+    if not original.is_file() or not work_file.is_file() or not export_file.is_file():
+        print("❌ restore-preserved 缺少原始文件、工作副本或工作 JSON")
+        sys.exit(1)
+
+    try:
+        from copy import deepcopy
+        from lxml import etree
+        from mqxliff_tool import parse_mqxliff
+
+        original_units, _ = parse_mqxliff(original)
+        preserved_targets = {
+            unit.id: unit.target_text
+            for unit in original_units
+            if (unit.target_text or "").strip()
+        }
+        if not preserved_targets:
+            print("❌ 原始 MQXLIFF 没有可恢复的既有译文")
+            sys.exit(1)
+
+        parser = etree.XMLParser(remove_blank_text=False)
+        original_tree = etree.parse(str(original), parser)
+        work_tree = etree.parse(str(work_file), parser)
+        ns = "{urn:oasis:names:tc:xliff:document:1.2}"
+        original_units_xml = {
+            unit.get("id", ""): unit
+            for unit in original_tree.getroot().iter(f"{ns}trans-unit")
+        }
+        work_units_xml = {
+            unit.get("id", ""): unit
+            for unit in work_tree.getroot().iter(f"{ns}trans-unit")
+        }
+        for entry_id in preserved_targets:
+            source_unit = original_units_xml.get(entry_id)
+            target_unit = work_units_xml.get(entry_id)
+            source_target = source_unit.find(f"{ns}target") if source_unit is not None else None
+            target_target = target_unit.find(f"{ns}target") if target_unit is not None else None
+            if source_target is None or target_unit is None:
+                raise ValueError(f"id={entry_id} 缺少可复制的 target")
+            if target_target is None:
+                source_elem = target_unit.find(f"{ns}source")
+                if source_elem is None:
+                    raise ValueError(f"id={entry_id} 缺少 source")
+                target_unit.insert(target_unit.index(source_elem) + 1, deepcopy(source_target))
+            else:
+                target_unit.replace(target_target, deepcopy(source_target))
+
+        with tempfile.NamedTemporaryFile(
+            prefix=f".restore_{project_id}_", suffix=work_file.suffix,
+            dir=work_file.parent, delete=False,
+        ) as temp_file:
+            candidate = Path(temp_file.name)
+        try:
+            work_tree.write(str(candidate), encoding="UTF-8", xml_declaration=True)
+            restored_units, _ = parse_mqxliff(candidate)
+            restored = {unit.id: unit.target_text for unit in restored_units}
+            mismatched = [
+                entry_id for entry_id, target in preserved_targets.items()
+                if restored.get(entry_id) != target
+            ]
+            if mismatched:
+                raise ValueError(
+                    f"恢复后既有译文不一致: {mismatched[:20]}"
+                )
+            os.replace(candidate, work_file)
+        finally:
+            candidate.unlink(missing_ok=True)
+    except (OSError, ValueError, etree.XMLSyntaxError) as exc:
+        print(f"❌ restore-preserved 失败: {exc}")
+        sys.exit(1)
+
+    with open(export_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    for entry in data.get("entries", []):
+        entry_id = str(entry.get("id"))
+        if entry_id in preserved_targets:
+            entry["target"] = preserved_targets[entry_id]
+    _write_json_atomic(export_file, data)
+
+    record["preserved_targets"] = preserved_targets
+    record["preserved_recovery"] = {
+        "source_sha256": _sha256_file(original),
+        "working_sha256": _sha256_file(work_file),
+        "count": len(preserved_targets),
+    }
+    _write_project_record(project_id, record)
+    print(f"✅ 已从原始文件恢复 {len(preserved_targets)} 条既有译文")
+
+
+def cmd_rebuild_runtime_tm(project_arg: Optional[str]) -> None:
+    """Quarantine legacy runtime TM files and rebuild only writable entries."""
+    project_id = _resolve_project_id(project_arg)
+    record = _read_project_record(project_id)
+    preserved_targets = record.get("preserved_targets")
+    if not isinstance(preserved_targets, dict):
+        print("❌ 项目未记录 preserved target 基线，先运行 restore-preserved")
+        sys.exit(1)
+    export_file = Path(record.get("export_file", ""))
+    if not export_file.is_file():
+        print(f"❌ 工作 JSON 不存在: {export_file}")
+        sys.exit(1)
+    with open(export_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    batches = record.get("batches")
+    if not isinstance(batches, list):
+        print("❌ 项目 manifest 缺少批次范围")
+        sys.exit(1)
+    submitted_batches = record.get("current_batch")
+    if not isinstance(submitted_batches, int) or isinstance(submitted_batches, bool):
+        submitted_batches = len(batches) if record.get("completed") else 0
+    if not 0 <= submitted_batches <= len(batches):
+        print("❌ 项目 manifest 的已提交批次数无效")
+        sys.exit(1)
+    runtime_dir = _tm_runtime_dir(record)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    existing = sorted(runtime_dir.glob("_batch_*.json"))
+    quarantined: list[str] = []
+    if existing:
+        from datetime import datetime
+
+        quarantine_dir = runtime_dir / (
+            "quarantine_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        )
+        quarantine_dir.mkdir(parents=True, exist_ok=False)
+        for path in existing:
+            destination = quarantine_dir / path.name
+            shutil.move(str(path), str(destination))
+            quarantined.append(str(destination.resolve()))
+
+    new_runtime_files = []
+    entries = data.get("entries", [])
+    for batch_num, bounds in enumerate(batches[:submitted_batches], 1):
+        if not isinstance(bounds, list) or len(bounds) != 2:
+            print(f"❌ manifest 第 {batch_num} 批范围无效")
+            sys.exit(1)
+        start, end = bounds
+        writable_ids = {
+            str(entry.get("id"))
+            for entry in entries[start:end]
+            if str(entry.get("id")) not in preserved_targets
+        }
+        runtime_file = _tm_runtime_path(record, batch_num)
+        _write_runtime_tm(export_file, runtime_file, writable_ids)
+        new_runtime_files.append(str(runtime_file.resolve()))
+
+    record["tm_runtime_files"] = new_runtime_files
+    record["runtime_tm_rebuild"] = {
+        "preserved_count": len(preserved_targets),
+        "quarantined_files": quarantined,
+        "runtime_files": new_runtime_files,
+    }
+    _write_project_record(project_id, record)
+    total = 0
+    for runtime_file in new_runtime_files:
+        with open(runtime_file, "r", encoding="utf-8") as f:
+            total += len(json.load(f).get("entries", []))
+    print(
+        f"✅ 已重建 {len(new_runtime_files)} 个运行期 TM 文件，共 {total} 条；"
+        f"已隔离旧文件 {len(quarantined)} 个"
+    )
+
+
+_CONTEXT_ANALYSIS_FIELDS = (
+    "id", "source", "target", "note", "context", "source_locked", "maxlengthchars",
+)
+
+
+def _context_entry_projection(entry: dict) -> dict:
+    """Keep only fields needed for document-level context analysis."""
+    projected: dict[str, Any] = {"id": str(entry.get("id", ""))}
+    for key in _CONTEXT_ANALYSIS_FIELDS[1:]:
+        value = entry.get(key)
+        if value not in (None, "", False):
+            projected[key] = value
+    return projected
+
+
+def _context_entry_chars(entry: dict) -> int:
+    return sum(
+        len(str(entry.get(key, "")))
+        for key in ("source", "target", "note", "context")
+    )
+
+
 def _split_context_entries(entries: list[dict], max_chars: int) -> list[list[dict]]:
     if max_chars <= 0:
         raise ValueError("max_chars 必须大于 0")
@@ -2033,7 +2553,7 @@ def _split_context_entries(entries: list[dict], max_chars: int) -> list[list[dic
     current = []
     current_chars = 0
     for entry in entries:
-        entry_chars = len(str(entry.get("source", "")))
+        entry_chars = _context_entry_chars(entry)
         if current and current_chars + entry_chars > max_chars:
             parts.append(current)
             current = []
@@ -2050,8 +2570,11 @@ def cmd_context_split(max_chars: int, project_arg: Optional[str] = None) -> Path
     state = _load_state(project_arg)
     with open(state["export_file"], "r", encoding="utf-8") as f:
         data = json.load(f)
+    analysis_entries = [
+        _context_entry_projection(entry) for entry in data.get("entries", [])
+    ]
     try:
-        parts = _split_context_entries(data.get("entries", []), max_chars)
+        parts = _split_context_entries(analysis_entries, max_chars)
     except ValueError as exc:
         print(f"❌ {exc}")
         sys.exit(1)
@@ -2128,8 +2651,9 @@ def cmd_context_pack(
         "project": project_id,
         "instructions": (
             "综合全部分片报告为一份全局语境报告。去重并解决冲突，"
-            "补充跨分片关联；最终报告必须覆盖规定的全部章节。"
+            "补充跨分片关联；最终报告必须覆盖规定的全部章节，且不超过 5500 字符。"
         ),
+        "max_report_chars": 5500,
         "part_reports": reports,
     }
     _write_json_atomic(output, payload)
@@ -2182,6 +2706,14 @@ def main():
         "--force-reinit", action="store_true",
         help="明确覆盖该 project 的现有初始化状态",
     )
+    p_init.add_argument(
+        "--require-agent-receipts", action="store_true",
+        help="要求语境、翻译、校对和 QA 阶段先记录角色 receipt",
+    )
+    p_init.add_argument(
+        "--reference-selection", type=Path, default=None,
+        help="用户确认的风格指南、术语、TM 与 QA/验证策略 JSON",
+    )
 
     def add_project_argument(command_parser):
         command_parser.add_argument(
@@ -2218,6 +2750,10 @@ def main():
     add_project_argument(p_retry)
     p_summary = sub.add_parser("summary", help="写入语境分析报告到 document_summary")
     p_summary.add_argument("report", type=str, help="报告文件路径（UTF-8 文本）")
+    p_summary.add_argument(
+        "--max-chars", type=int, default=5500,
+        help="最终报告字符上限（默认 5500）",
+    )
     add_project_argument(p_summary)
     p_refresh = sub.add_parser("refresh", help="重新解析工作文件并重跑术语/TM/风格指南增强")
     add_project_argument(p_refresh)
@@ -2236,6 +2772,25 @@ def main():
     add_project_argument(p_gaps)
     p_gaps.add_argument("--out", type=str, default=None,
                         help="输出路径（默认 _temp/term_gaps_<stem>.md）")
+    p_tag_audit = sub.add_parser("tag-audit", help="只读审计既有译文的标签风险")
+    add_project_argument(p_tag_audit)
+    p_tag_audit.add_argument("--out", type=str, default=None,
+                             help="输出路径（默认 _temp/tag_audit_<project>.md）")
+    p_restore_preserved = sub.add_parser(
+        "restore-preserved", help="从原始 MQXLIFF 恢复遗留项目的既有译文"
+    )
+    add_project_argument(p_restore_preserved)
+    p_rebuild_runtime = sub.add_parser(
+        "rebuild-runtime-tm", help="隔离旧运行期 TM 并按新增译文重建"
+    )
+    add_project_argument(p_rebuild_runtime)
+    p_receipt = sub.add_parser("receipt", help="记录子代理角色与落盘输出回执")
+    p_receipt.add_argument("stage", choices=("context-analyzer", "translator", "trans-reviewer", "qa-reviewer"))
+    p_receipt.add_argument("--agent-id", required=True, type=str, help="实际子代理任务 ID")
+    p_receipt.add_argument("--role-config", required=True, type=Path, help="本次调用使用的角色 TOML")
+    p_receipt.add_argument("--input", required=True, type=Path, help="代理输入文件")
+    p_receipt.add_argument("--output", required=True, type=Path, help="代理输出文件")
+    add_project_argument(p_receipt)
     p_version = sub.add_parser("version", help="显示工具包与工作流协议版本")
     p_version.add_argument("--json", action="store_true", help="以 JSON 输出")
     p_context_split = sub.add_parser("context-split", help="生成语境分析分片")
@@ -2272,6 +2827,8 @@ def main():
             resume=args.resume,
             project_id=args.project,
             force_reinit=args.force_reinit,
+            require_agent_receipts=args.require_agent_receipts,
+            reference_selection_path=args.reference_selection,
         )
     elif args.command == "next":
         cmd_next(review_only=args.review, project_arg=args.project)
@@ -2293,13 +2850,28 @@ def main():
     elif args.command == "retry":
         cmd_retry(args.project)
     elif args.command == "summary":
-        cmd_summary(Path(args.report), args.project)
+        cmd_summary(Path(args.report), args.project, args.max_chars)
     elif args.command == "refresh":
         cmd_refresh(args.project, args.tm, args.terms, args.style_guide)
     elif args.command == "export":
         cmd_export(args.project, args.out, args.force)
     elif args.command == "term-gaps":
         cmd_term_gaps(args.project, args.out)
+    elif args.command == "tag-audit":
+        cmd_tag_audit(args.project, args.out)
+    elif args.command == "restore-preserved":
+        cmd_restore_preserved(args.project)
+    elif args.command == "rebuild-runtime-tm":
+        cmd_rebuild_runtime_tm(args.project)
+    elif args.command == "receipt":
+        cmd_receipt(
+            args.stage,
+            args.agent_id,
+            args.role_config,
+            args.input,
+            args.output,
+            args.project,
+        )
     elif args.command == "version":
         version_info = {
             "toolkit_version": TOOLKIT_VERSION,
