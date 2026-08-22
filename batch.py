@@ -15,6 +15,9 @@ import re
 import shutil
 import sys
 import tempfile
+import time
+import uuid
+from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
 
@@ -24,7 +27,12 @@ from validation import (
     load_validation_policy,
     validate_batch_results,
 )
-from qa_checks import load_qa_policy, run_qa, validate_qa_report
+from layout import layout_metadata, layout_preview
+from project_rules import (
+    ProjectRulesError, create_revision, current as current_project_rules,
+    ensure_current as ensure_project_rules, rules_root, set_current as set_project_rules,
+)
+from qa_checks import load_qa_policy, run_qa, run_qa_plugin, validate_qa_report
 from toolkit_version import TOOLKIT_VERSION, WORKFLOW_PROTOCOL_VERSION
 
 if sys.platform == "win32":
@@ -262,6 +270,407 @@ _ROLE_MODEL_CONTRACT = {
 }
 
 
+_AGENT_STAGES = frozenset(_ROLE_MODEL_CONTRACT)
+_ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_EXECUTION_SURFACES = frozenset({"app", "cli", "ide", "unspecified"})
+
+
+def _batch_export_dir(state: dict) -> Path:
+    return _SCRIPT_DIR / "exports" / state["stem"]
+
+
+def _stage_input_path(state: dict, stage: str) -> Path:
+    batch_num = state.get("current_batch", 0) + 1
+    directory = _batch_export_dir(state)
+    paths = {
+        "translator": directory / f"_batch_{batch_num:03d}_to_translate.json",
+        "trans-reviewer": directory / f"_batch_{batch_num:03d}_to_review.json",
+        "qa-reviewer": directory / f"_batch_{batch_num:03d}_qa_task.json",
+    }
+    if stage not in paths:
+        raise ValueError(f"{stage} 必须显式提供 --input")
+    return paths[stage]
+
+
+def _stage_output_paths(
+    state: dict, stage: str, context_output_name: str | None = None,
+) -> dict[str, Path]:
+    batch_num = state.get("current_batch", 0) + 1
+    directory = _batch_export_dir(state)
+    if stage == "translator":
+        return {"result": directory / f"_batch_{batch_num:03d}_translated.json"}
+    if stage == "trans-reviewer":
+        return {"result": directory / f"_batch_{batch_num:03d}_reviewed.json"}
+    if stage == "qa-reviewer":
+        return {
+            "result": directory / f"_batch_{batch_num:03d}_qa_reviewed.json",
+            "report": directory / f"_batch_{batch_num:03d}_qa_report.json",
+        }
+    if stage == "context-analyzer":
+        if not context_output_name or Path(context_output_name).name != context_output_name:
+            raise ValueError("context-analyzer 必须提供安全的 --output-name")
+        return {"result": _SCRIPT_DIR.parent / "_temp" / context_output_name}
+    raise ValueError(f"未知 agent stage: {stage}")
+
+
+def _stage_status_is_ready(state: dict, stage: str) -> bool:
+    required = {
+        "translator": "awaiting_translation",
+        "trans-reviewer": "awaiting_review",
+        "qa-reviewer": "pending_agent",
+    }.get(stage)
+    return required is None or state.get("qa_status") == required
+
+
+def _set_active_task(
+    state: dict, stage: str, input_path: Path, *, upstream_paths: tuple[Path, ...] = (),
+) -> None:
+    state.setdefault("active_tasks", {})[stage] = {
+        "input": str(input_path.resolve()),
+        "input_sha256": _sha256_file(input_path),
+        "upstream_sha256": {
+            str(path.resolve()): _sha256_file(path) for path in upstream_paths
+        },
+        "project_rules_revision": state.get("project_rules_revision"),
+        "batch": state.get("current_batch", 0) + 1,
+    }
+
+
+def _require_active_task(state: dict, stage: str, input_path: Path) -> dict:
+    task = (state.get("active_tasks") or {}).get(stage)
+    if not isinstance(task, dict):
+        print(f"❌ 缺少当前 {stage} 任务契约，请重新运行 next 或 qa")
+        sys.exit(1)
+    if (
+        task.get("batch") != state.get("current_batch", 0) + 1
+        or task.get("project_rules_revision") != state.get("project_rules_revision")
+        or task.get("input") != str(input_path.resolve())
+        or task.get("input_sha256") != _sha256_file(input_path)
+    ):
+        print(f"❌ {stage} 任务输入或规则 revision 已变化，请重新生成当前任务")
+        sys.exit(1)
+    for raw_path, expected_sha in (task.get("upstream_sha256") or {}).items():
+        path = Path(raw_path)
+        if _sha256_file(path) != expected_sha:
+            print(f"❌ {stage} 上游文件已变化: {path}；请重新生成当前任务")
+            sys.exit(1)
+    return task
+
+
+def _attempt_root(state: dict, stage: str, attempt_id: str) -> Path:
+    return (
+        _SCRIPT_DIR.parent / "_temp" / "agents" / state["stem"]
+        / f"batch_{state.get('current_batch', 0) + 1:03d}" / stage / attempt_id
+    )
+
+
+def _completion_event_path(attempt_dir: Path) -> Path:
+    return attempt_dir.resolve() / "completion_event.json"
+
+
+def _stable_sha256(path: Path) -> str | None:
+    """Reject files modified while their promotion hash is being established."""
+    try:
+        first_stat = path.stat()
+        first_hash = _sha256_file(path)
+        time.sleep(0.05)
+        second_stat = path.stat()
+        second_hash = _sha256_file(path)
+    except OSError:
+        return None
+    if (
+        first_hash is None
+        or first_hash != second_hash
+        or first_stat.st_size != second_stat.st_size
+        or first_stat.st_mtime_ns != second_stat.st_mtime_ns
+    ):
+        return None
+    return first_hash
+
+
+def _promote_files_transactionally(files: list[tuple[Path, Path]]) -> None:
+    """Copy all staged outputs before replacing destinations, with rollback."""
+    prepared: list[tuple[Path, Path]] = []
+    backups: list[tuple[Path, Path, bool]] = []
+    replaced: list[tuple[Path, Path, bool]] = []
+    try:
+        for source, destination in files:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{destination.name}.", suffix=".promote", dir=destination.parent,
+            )
+            with os.fdopen(fd, "wb") as out, open(source, "rb") as inp:
+                shutil.copyfileobj(inp, out)
+                out.flush()
+                os.fsync(out.fileno())
+            prepared.append((Path(temp_name), destination))
+        for _, destination in prepared:
+            existed = destination.is_file()
+            backup = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.backup")
+            if existed:
+                shutil.copy2(destination, backup)
+            backups.append((backup, destination, existed))
+        for temporary, destination in prepared:
+            existed = next(item[2] for item in backups if item[1] == destination)
+            os.replace(temporary, destination)
+            replaced.append((temporary, destination, existed))
+    except Exception:
+        for _, destination, existed in reversed(replaced):
+            backup = next(item[0] for item in backups if item[1] == destination)
+            if existed and backup.is_file():
+                os.replace(backup, destination)
+            elif not existed:
+                destination.unlink(missing_ok=True)
+        raise
+    finally:
+        for temporary, _ in prepared:
+            temporary.unlink(missing_ok=True)
+        for backup, _, _ in backups:
+            backup.unlink(missing_ok=True)
+
+
+def _load_current_agent_attempt(
+    state: dict, stage: str, attempt_dir: Path,
+) -> tuple[dict, Path]:
+    attempt_dir = attempt_dir.resolve()
+    attempt_path = attempt_dir / "attempt.json"
+    attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+    if not isinstance(attempt, dict):
+        raise ValueError("attempt.json 必须是对象")
+    if (
+        attempt.get("stage") != stage
+        or attempt.get("project") != state.get("stem")
+        or attempt.get("batch") != state.get("current_batch", 0) + 1
+        or attempt.get("project_rules_revision") != state.get("project_rules_revision")
+        or str(attempt_dir) not in (state.get("agent_attempts", {}).get(stage) or [])
+    ):
+        raise ValueError("attempt 不属于当前项目、批次或规则 revision")
+    input_path = Path(attempt["input"])
+    _require_active_task(state, stage, input_path)
+    if attempt.get("input_sha256") != _sha256_file(input_path):
+        raise ValueError("attempt 输入已变化")
+    return attempt, input_path
+
+
+def cmd_agent_attempt(
+    stage: str,
+    input_path: Path | None,
+    project_arg: Optional[str] = None,
+    *,
+    attempt_id: str | None = None,
+    output_name: str | None = None,
+    execution_surface: str = "unspecified",
+) -> dict:
+    """Create an isolated output directory for one externally spawned role."""
+    if stage not in _AGENT_STAGES:
+        print(f"❌ 未知 agent stage: {stage}")
+        sys.exit(1)
+    state = _load_state(project_arg)
+    _require_current_rules(state)
+    if not _stage_status_is_ready(state, stage):
+        print(f"❌ 当前状态不允许启动 {stage} attempt")
+        sys.exit(1)
+    try:
+        canonical_input = _stage_input_path(state, stage) if stage != "context-analyzer" else input_path
+        if canonical_input is None:
+            raise ValueError("context-analyzer 必须提供 --input")
+        canonical_input = canonical_input.resolve()
+        if input_path is not None and stage != "context-analyzer" and input_path.resolve() != canonical_input:
+            raise ValueError(f"{stage} 输入必须为当前任务: {canonical_input}")
+        if not canonical_input.is_file():
+            raise ValueError(f"输入文件不存在: {canonical_input}")
+        if stage != "context-analyzer":
+            _require_active_task(state, stage, canonical_input)
+        else:
+            _set_active_task(state, stage, canonical_input)
+        if execution_surface not in _EXECUTION_SURFACES:
+            raise ValueError("execution surface 必须是 app、cli、ide 或 unspecified")
+        attempt_id = attempt_id or f"attempt_{uuid.uuid4().hex[:12]}"
+        if not _ATTEMPT_ID_RE.fullmatch(attempt_id):
+            raise ValueError("attempt id 只能包含字母、数字、_ 和 -")
+        directory = _attempt_root(state, stage, attempt_id)
+        if directory.exists():
+            raise ValueError(f"attempt 已存在: {directory}")
+        destinations = _stage_output_paths(state, stage, output_name)
+        outputs = {name: str((directory / path.name).resolve()) for name, path in destinations.items()}
+        # The source task remains the provenance input.  The role receives an
+        # attempt-local copy so its explicit output paths cannot bypass promotion.
+        agent_input = directory / "agent_task.json"
+        task_payload = json.loads(canonical_input.read_text(encoding="utf-8"))
+        if not isinstance(task_payload, dict):
+            raise ValueError("代理输入任务必须是 JSON 对象")
+        task_payload["agent_attempt"] = {
+            "attempt_id": attempt_id,
+            "stage": stage,
+            "execution_surface": execution_surface,
+            "outputs": outputs,
+        }
+        if stage == "qa-reviewer":
+            task_payload["qa_reviewed_path"] = outputs["result"]
+            task_payload["qa_report_path"] = outputs["report"]
+        _write_json_atomic(agent_input, task_payload)
+        contract = (state.get("active_tasks") or {}).get(stage, {})
+        attempt = {
+            "schema_version": 1,
+            "stage": stage,
+            "project": state["stem"],
+            "batch": state.get("current_batch", 0) + 1,
+            "attempt_id": attempt_id,
+            "project_rules_revision": state.get("project_rules_revision"),
+            "execution_surface": execution_surface,
+            "input": str(canonical_input),
+            "input_sha256": _sha256_file(canonical_input),
+            "agent_input": str(agent_input.resolve()),
+            "agent_input_sha256": _sha256_file(agent_input),
+            "upstream_sha256": dict(contract.get("upstream_sha256") or {}),
+            "outputs": outputs,
+            "destinations": {name: str(path.resolve()) for name, path in destinations.items()},
+        }
+        _write_json_atomic(directory / "attempt.json", attempt)
+        state.setdefault("agent_attempts", {}).setdefault(stage, []).append(str(directory.resolve()))
+        _save_state(state)
+    except (OSError, ValueError) as exc:
+        print(f"❌ 无法创建 agent attempt: {exc}")
+        sys.exit(1)
+    print(json.dumps(attempt, ensure_ascii=False, indent=2))
+    return attempt
+
+
+def cmd_agent_complete(
+    stage: str,
+    attempt_dir: Path,
+    agent_id: str,
+    project_arg: Optional[str] = None,
+) -> Path:
+    """Bind stable attempt outputs to a completed native or CLI subagent."""
+    if stage not in _AGENT_STAGES or not str(agent_id).strip():
+        print("❌ agent-complete 需要有效 stage 和非空 agent_id")
+        sys.exit(1)
+    state = _load_state(project_arg)
+    _require_current_rules(state)
+    try:
+        attempt, _ = _load_current_agent_attempt(state, stage, attempt_dir)
+        staged = {name: Path(path) for name, path in (attempt.get("outputs") or {}).items()}
+        if not staged:
+            raise ValueError("attempt 输出契约无效")
+        output_hashes = {}
+        for name, path in staged.items():
+            stable_hash = _stable_sha256(path)
+            if stable_hash is None:
+                raise ValueError(f"{name} 输出不存在或尚未稳定")
+            output_hashes[name] = stable_hash
+        event = {
+            "schema_version": 1,
+            "event": "agent_completed",
+            "status": "completed",
+            "agent_id": str(agent_id),
+            "attempt_id": attempt["attempt_id"],
+            "exit_code": 0,
+            "outputs": output_hashes,
+        }
+        event_path = _completion_event_path(attempt_dir)
+        if event_path.exists():
+            existing = json.loads(event_path.read_text(encoding="utf-8"))
+            if existing != event:
+                raise ValueError("attempt 已有不一致的完成事件")
+        else:
+            _write_json_atomic(event_path, event)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"❌ agent-complete 失败: {exc}")
+        sys.exit(1)
+    print(json.dumps({
+        "completion_event": str(event_path.resolve()),
+        "agent_id": str(agent_id),
+        "attempt_id": attempt["attempt_id"],
+        "outputs": output_hashes,
+    }, ensure_ascii=False))
+    return event_path
+
+
+def cmd_promote(
+    stage: str,
+    attempt_dir: Path,
+    agent_id: str,
+    role_config: Path,
+    completion_event: Path,
+    project_arg: Optional[str] = None,
+) -> None:
+    """Atomically promote a completed attempt and generate receipt schema v2."""
+    if stage not in _AGENT_STAGES or not str(agent_id).strip():
+        print("❌ promote 需要有效 stage 和非空 agent_id")
+        sys.exit(1)
+    state = _load_state(project_arg)
+    _require_current_rules(state)
+    try:
+        attempt_dir = attempt_dir.resolve()
+        attempt, input_path = _load_current_agent_attempt(state, stage, attempt_dir)
+        config = _read_role_config(role_config)
+        expected_model, expected_effort = _ROLE_MODEL_CONTRACT[stage]
+        if (
+            config["name"] != stage
+            or config["model"] != expected_model
+            or config["model_reasoning_effort"] != expected_effort
+        ):
+            raise ValueError(f"角色配置不符合 {stage} 的模型契约")
+        expected_event_path = _completion_event_path(attempt_dir)
+        if completion_event.resolve() != expected_event_path:
+            raise ValueError("完成事件必须由 agent-complete 写入 attempt 目录")
+        event = json.loads(expected_event_path.read_text(encoding="utf-8"))
+        if not isinstance(event, dict) or set(event) != {
+            "schema_version", "event", "status", "agent_id", "attempt_id", "exit_code", "outputs"
+        }:
+            raise ValueError("完成事件 schema 无效")
+        if (
+            event["schema_version"] != 1 or event["event"] != "agent_completed"
+            or event["status"] != "completed" or event["agent_id"] != str(agent_id)
+            or event["attempt_id"] != attempt["attempt_id"] or event["exit_code"] != 0
+            or not isinstance(event["outputs"], dict)
+        ):
+            raise ValueError("完成事件不是当前 attempt 的成功完成事件")
+        staged = {name: Path(path) for name, path in (attempt.get("outputs") or {}).items()}
+        destinations = {name: Path(path) for name, path in (attempt.get("destinations") or {}).items()}
+        if set(staged) != set(destinations) or not staged:
+            raise ValueError("attempt 输出契约无效")
+        output_hashes = {}
+        for name, path in staged.items():
+            stable_hash = _stable_sha256(path)
+            if stable_hash is None or event["outputs"].get(name) != stable_hash:
+                raise ValueError(f"{name} 输出不存在、未稳定或与完成事件不一致")
+            output_hashes[name] = stable_hash
+        _promote_files_transactionally([(staged[name], destinations[name]) for name in sorted(staged)])
+        if any(_sha256_file(destinations[name]) != output_hashes[name] for name in destinations):
+            raise ValueError("晋升后的输出哈希不一致")
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"❌ promote 失败: {exc}")
+        sys.exit(1)
+    receipt = {
+        "schema_version": 2,
+        "workflow_protocol": WORKFLOW_PROTOCOL_VERSION,
+        "stage": stage,
+        "batch": state.get("current_batch", 0) + 1,
+        "agent_id": str(agent_id),
+        "attempt_id": attempt["attempt_id"],
+        "attempt_dir": str(attempt_dir.resolve()),
+        "role_config": str(role_config.resolve()),
+        "role_config_sha256": _sha256_file(role_config),
+        "model": config["model"],
+        "model_reasoning_effort": config["model_reasoning_effort"],
+        "input": str(input_path.resolve()),
+        "input_sha256": _sha256_file(input_path),
+        "upstream_sha256": dict(attempt.get("upstream_sha256") or {}),
+        "project_rules_revision": state.get("project_rules_revision"),
+        "execution_surface": attempt.get("execution_surface", "unspecified"),
+        "completion_event": str(completion_event.resolve()),
+        "completion_event_sha256": _sha256_file(completion_event),
+        "outputs": [
+            {"name": name, "path": str(destinations[name].resolve()), "sha256": output_hashes[name]}
+            for name in sorted(destinations)
+        ],
+    }
+    _write_json_atomic(_receipt_path(state, stage), receipt)
+    print(f"✅ 已晋升 {stage} attempt 并记录 receipt v2: {_receipt_path(state, stage)}")
+
+
 def cmd_receipt(
     stage: str,
     agent_id: str,
@@ -270,54 +679,10 @@ def cmd_receipt(
     output_path: Path,
     project_arg: Optional[str] = None,
 ):
-    """Record a verifiable role-output receipt for an agentic pipeline stage."""
-    allowed_stages = {"context-analyzer", "translator", "trans-reviewer", "qa-reviewer"}
-    if stage not in allowed_stages:
-        print(f"❌ 未知 receipt stage: {stage}")
-        sys.exit(1)
-    if not str(agent_id).strip():
-        print("❌ receipt 必须提供非空 agent_id")
-        sys.exit(1)
-    for label, path in (("角色配置", role_config), ("输入", input_path), ("输出", output_path)):
-        if not path.is_file():
-            print(f"❌ receipt {label}文件不存在: {path}")
-            sys.exit(1)
-    try:
-        config = _read_role_config(role_config)
-    except (OSError, ValueError) as exc:
-        print(f"❌ receipt 角色配置无效: {exc}")
-        sys.exit(1)
-    if config["name"] != stage:
-        print(f"❌ receipt stage 与角色配置不一致: {stage} != {config['name']}")
-        sys.exit(1)
-    expected_model, expected_effort = _ROLE_MODEL_CONTRACT[stage]
-    if (
-        config["model"] != expected_model
-        or config["model_reasoning_effort"] != expected_effort
-    ):
-        print(
-            f"❌ receipt 角色模型不符合工作流契约: {stage} 必须使用 "
-            f"{expected_model} / {expected_effort}"
-        )
-        sys.exit(1)
-    state = _load_state(project_arg)
-    receipt = {
-        "schema_version": 1,
-        "stage": stage,
-        "batch": state.get("current_batch", 0) + 1,
-        "agent_id": str(agent_id),
-        "role_config": str(role_config.resolve()),
-        "role_config_sha256": _sha256_file(role_config),
-        "model": config["model"],
-        "model_reasoning_effort": config["model_reasoning_effort"],
-        "input": str(input_path.resolve()),
-        "input_sha256": _sha256_file(input_path),
-        "output": str(output_path.resolve()),
-        "output_sha256": _sha256_file(output_path),
-    }
-    path = _receipt_path(state, stage)
-    _write_json_atomic(path, receipt)
-    print(f"✅ 已记录 {stage} receipt: {path}")
+    """Reject legacy manual receipts retained only for CLI compatibility."""
+    del stage, agent_id, role_config, input_path, output_path, project_arg
+    print("❌ protocol 10 不接受手工 receipt；请先运行 agent-attempt，再以真实完成事件运行 promote")
+    sys.exit(1)
 
 
 def _require_agent_receipt(state: dict, stage: str, output_path: Path) -> None:
@@ -332,18 +697,84 @@ def _require_agent_receipt(state: dict, stage: str, output_path: Path) -> None:
     except (OSError, json.JSONDecodeError) as exc:
         print(f"❌ {stage} receipt 无效: {exc}")
         sys.exit(1)
+    outputs = receipt.get("outputs")
+    expected_outputs = {"result": output_path}
+    if stage == "qa-reviewer":
+        expected_outputs["report"] = _current_qa_report_path(state)
+    actual_outputs = {
+        item.get("name"): item for item in outputs
+    } if isinstance(outputs, list) else {}
     if (
-        receipt.get("stage") != stage
+        receipt.get("schema_version") != 2
+        or receipt.get("workflow_protocol") != WORKFLOW_PROTOCOL_VERSION
+        or receipt.get("stage") != stage
         or receipt.get("batch") != state.get("current_batch", 0) + 1
-        or receipt.get("output") != str(output_path.resolve())
-        or receipt.get("output_sha256") != _sha256_file(output_path)
+        or receipt.get("project_rules_revision") != state.get("project_rules_revision")
+        or set(actual_outputs) != set(expected_outputs)
+        or any(
+            item.get("path") != str(path.resolve()) or item.get("sha256") != _sha256_file(path)
+            for name, path in expected_outputs.items()
+            for item in [actual_outputs.get(name, {})]
+        )
     ):
         print(f"❌ {stage} receipt 与当前输出不一致，不能推进")
         sys.exit(1)
 
 
 def _project_rules_dir(project_id: str) -> Path:
+    """Protocol-9 location retained only for explicit project-config migrate."""
     return _SCRIPT_DIR / "data" / project_id / "project_rules"
+
+
+def _project_runtime_root() -> Path:
+    return _SCRIPT_DIR / "data" / "project_tm_runtime"
+
+
+def _rules_policy_record(record: dict) -> tuple[dict, dict]:
+    """Load a revision's effective policies, binding the frozen plugin path."""
+    validation = load_validation_policy(record["validation_policy_path"])
+    qa = load_qa_policy(record["qa_policy_path"])
+    if record.get("qa_plugin_path"):
+        qa["plugin"] = {
+            "path": record["qa_plugin_path"],
+            "timeout_seconds": 30,
+        }
+        # Validate again after the immutable revision path is injected.
+        from qa_checks import _validate_qa_policy
+        _validate_qa_policy(qa)
+    return validation, qa
+
+
+def _bind_rules_to_state(state: dict, record: dict) -> None:
+    validation, qa = _rules_policy_record(record)
+    state["project_rules_revision"] = record["revision"]
+    state["validation_policy_path"] = record["validation_policy_path"]
+    state["validation_policy"] = validation
+    state["qa_policy_path"] = record["qa_policy_path"]
+    state["qa_policy"] = qa
+    state["project_rules_current_path"] = str((rules_root(_SCRIPT_DIR) / "current.json").resolve())
+
+
+def _state_rules_revision_is_current(state: dict) -> bool:
+    record = current_project_rules(_SCRIPT_DIR)
+    return bool(record and state.get("project_rules_revision") == record.get("revision"))
+
+
+def _require_current_rules(state: dict) -> None:
+    """Reject old task chains after an explicit shared-rule upgrade."""
+    try:
+        record = current_project_rules(_SCRIPT_DIR)
+    except ProjectRulesError as exc:
+        print(f"❌ 共享项目规则无效: {exc}")
+        sys.exit(1)
+    if record and state.get("project_rules_revision") != record.get("revision"):
+        print("❌ 当前文件仍绑定旧项目规则 revision，请运行 project-config migrate 或重新 init")
+        sys.exit(1)
+    if state.get("active_task_revision") is not None and (
+        state.get("active_task_revision") != state.get("project_rules_revision")
+    ):
+        print("❌ 当前任务由旧项目规则生成，请先重新运行 next")
+        sys.exit(1)
 
 
 def _write_project_policy_snapshots(
@@ -384,6 +815,238 @@ def _write_project_policy_snapshots(
         "qa_policy_path": str(qa_path.resolve()),
         "policy_manifest_path": str(manifest_path.resolve()),
     }
+
+
+def _state_files() -> list[Path]:
+    data_dir = _SCRIPT_DIR / "data"
+    if not data_dir.is_dir():
+        return []
+    return sorted(
+        path for path in data_dir.glob("*/batch_state.json")
+        if path.parent.name not in {"project_rules", "project_tm_runtime"}
+    )
+
+
+def _read_policy_inputs(
+    validation_path: Optional[Path], qa_path: Optional[Path], *, use_current: bool,
+) -> tuple[dict, dict]:
+    record = current_project_rules(_SCRIPT_DIR) if use_current else None
+    validation = load_validation_policy(
+        validation_path or (record or {}).get("validation_policy_path")
+    )
+    qa = load_qa_policy(qa_path or (record or {}).get("qa_policy_path"))
+    return validation, qa
+
+
+def _write_json_transaction(updates: dict[Path, dict]) -> None:
+    """Replace a set of JSON files as one recoverable local transaction."""
+    prepared: list[tuple[Path, Path]] = []
+    backups: list[tuple[Path, Path, bool]] = []
+    replaced: list[tuple[Path, Path, bool]] = []
+    try:
+        for destination, value in updates.items():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(
+                prefix=f".{destination.name}.", suffix=".transaction", dir=destination.parent,
+            )
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(value, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            prepared.append((Path(temporary), destination))
+        for _, destination in prepared:
+            existed = destination.is_file()
+            backup = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.backup")
+            if existed:
+                shutil.copy2(destination, backup)
+            backups.append((backup, destination, existed))
+        for temporary, destination in prepared:
+            existed = next(item[2] for item in backups if item[1] == destination)
+            os.replace(temporary, destination)
+            replaced.append((temporary, destination, existed))
+    except Exception as exc:
+        for _, destination, existed in reversed(replaced):
+            backup = next(item[0] for item in backups if item[1] == destination)
+            if existed and backup.is_file():
+                os.replace(backup, destination)
+            elif not existed:
+                destination.unlink(missing_ok=True)
+        raise ProjectRulesError(f"规则状态事务失败: {exc}") from exc
+    finally:
+        for temporary, _ in prepared:
+            temporary.unlink(missing_ok=True)
+        for backup, _, _ in backups:
+            backup.unlink(missing_ok=True)
+
+
+def _set_all_active_states_to_rules(
+    record: dict, previous_revision: Optional[str], *, update_current: bool,
+) -> int:
+    updates: dict[Path, dict] = {}
+    try:
+        for path in _state_files():
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                continue
+            before = state.get("project_rules_revision")
+            _bind_rules_to_state(state, record)
+            if before != record["revision"]:
+                state["active_task_revision"] = None
+                state["qa_status"] = "not_started"
+                state["active_tasks"] = {}
+                state["agent_attempts"] = {}
+                state["rules_invalidated"] = {
+                    "from_revision": before or previous_revision,
+                    "to_revision": record["revision"],
+                    "reason": "project-config update",
+                }
+            updates[path] = state
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise ProjectRulesError(f"无法升级活动 state: {exc}") from exc
+    if update_current:
+        updates[rules_root(_SCRIPT_DIR) / "current.json"] = record
+    _write_json_transaction(updates)
+    return len(updates) - int(update_current)
+
+
+def cmd_project_config_init(
+    validation_path: Optional[Path], qa_path: Optional[Path], plugin_path: Optional[Path],
+) -> None:
+    if current_project_rules(_SCRIPT_DIR) is not None:
+        print("❌ 项目规则已存在；请使用 project-config show 或 update")
+        sys.exit(1)
+    try:
+        validation, qa = _read_policy_inputs(validation_path, qa_path, use_current=False)
+        record = set_project_rules(
+            _SCRIPT_DIR,
+            create_revision(
+                _SCRIPT_DIR, validation, qa, plugin_path=plugin_path,
+                sources={
+                    "validation_policy": str(validation_path.resolve()) if validation_path else None,
+                    "qa_policy": str(qa_path.resolve()) if qa_path else None,
+                    "qa_plugin": str(plugin_path.resolve()) if plugin_path else None,
+                },
+            ),
+        )
+    except (OSError, ValueError, ProjectRulesError) as exc:
+        print(f"❌ 初始化项目规则失败: {exc}")
+        sys.exit(1)
+    print(f"✅ 已初始化项目规则 revision: {record['revision']}")
+
+
+def cmd_project_config_show() -> None:
+    try:
+        record = current_project_rules(_SCRIPT_DIR)
+    except ProjectRulesError as exc:
+        print(f"❌ 项目规则无效: {exc}")
+        sys.exit(1)
+    if record is None:
+        print("ℹ️ 项目规则尚未初始化")
+        return
+    active = len(_state_files())
+    print(json.dumps({**record, "active_documents": active}, ensure_ascii=False, indent=2))
+
+
+def cmd_project_config_update(
+    validation_path: Optional[Path], qa_path: Optional[Path], plugin_path: Optional[Path],
+    clear_plugin: bool,
+) -> None:
+    try:
+        previous = current_project_rules(_SCRIPT_DIR)
+        if previous is None:
+            raise ProjectRulesError("项目规则尚未初始化，请先运行 project-config init")
+        validation, qa = _read_policy_inputs(validation_path, qa_path, use_current=True)
+        selected_plugin = None if clear_plugin else (plugin_path or (
+            Path(previous["qa_plugin_path"]) if previous.get("qa_plugin_path") else None
+        ))
+        record = create_revision(
+            _SCRIPT_DIR, validation, qa, plugin_path=selected_plugin,
+            sources={
+                "validation_policy": str(validation_path.resolve()) if validation_path else previous.get("sources", {}).get("validation_policy"),
+                "qa_policy": str(qa_path.resolve()) if qa_path else previous.get("sources", {}).get("qa_policy"),
+                "qa_plugin": str(selected_plugin.resolve()) if selected_plugin else None,
+            },
+        )
+        updated = _set_all_active_states_to_rules(
+            record, previous.get("revision"), update_current=True,
+        )
+    except (OSError, ValueError, ProjectRulesError) as exc:
+        print(f"❌ 更新项目规则失败: {exc}")
+        sys.exit(1)
+    print(f"✅ 项目规则已升级: {record['revision']}；已使 {updated} 个活动文件的旧任务失效")
+
+
+def _copy_file_atomic(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
+    try:
+        with os.fdopen(fd, "wb") as out, open(source, "rb") as inp:
+            shutil.copyfileobj(inp, out)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, destination)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def cmd_project_config_migrate() -> None:
+    """Migrate compatible protocol-9 per-document rules and runtime TM non-destructively."""
+    states: list[tuple[Path, dict]] = []
+    policies: list[tuple[dict, dict]] = []
+    for path in _state_files():
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                continue
+            states.append((path, state))
+            policies.append((
+                state.get("validation_policy") or load_validation_policy(state.get("validation_policy_path")),
+                state.get("qa_policy") or load_qa_policy(state.get("qa_policy_path")),
+            ))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"❌ 无法读取旧 state {path}: {exc}")
+            sys.exit(1)
+    try:
+        record = current_project_rules(_SCRIPT_DIR)
+        create_current = record is None
+        if record is None:
+            if not policies:
+                raise ProjectRulesError("未找到可迁移的活动 state；请使用 project-config init")
+            fingerprints = {
+                json.dumps({"validation": validation, "qa": qa}, ensure_ascii=False, sort_keys=True)
+                for validation, qa in policies
+            }
+            if len(fingerprints) != 1:
+                raise ProjectRulesError("旧文件的策略不一致；请先 project-config init 指定统一策略")
+            validation, qa = policies[0]
+            record = create_revision(
+                _SCRIPT_DIR, validation, qa, sources={"migration": "protocol-9"},
+            )
+        copied = 0
+        data_dir = _SCRIPT_DIR / "data"
+        for legacy_dir in data_dir.glob("*/tm_runtime"):
+            document_id = legacy_dir.parent.name
+            for source in legacy_dir.glob("_batch_*.json"):
+                destination = _project_runtime_root() / document_id / source.name
+                if destination.is_file():
+                    if _sha256_file(destination) != _sha256_file(source):
+                        raise ProjectRulesError(f"运行期 TM 冲突: {destination}")
+                    continue
+                _copy_file_atomic(source, destination)
+                copied += 1
+        updated = _set_all_active_states_to_rules(
+            record, None, update_current=create_current,
+        )
+        for path, state in states:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            document_id = state.get("project_id") or state.get("stem")
+            if document_id:
+                state["tm_runtime_dir"] = str((_project_runtime_root() / str(document_id)).resolve())
+                _write_json_atomic(path, state)
+    except (OSError, ValueError, ProjectRulesError) as exc:
+        print(f"❌ 迁移失败: {exc}")
+        sys.exit(1)
+    print(f"✅ 已迁移共享规则 revision {record['revision']}；复制 {copied} 个运行期 TM 文件，升级 {updated} 个活动文件")
 
 
 def _validate_reference_selection(
@@ -450,7 +1113,7 @@ def _tm_runtime_dir(state: dict) -> Path:
     if configured:
         return Path(configured)
     project_id = state.get("project_id") or state.get("stem") or ".no-project"
-    return _SCRIPT_DIR / "data" / project_id / "tm_runtime"
+    return _project_runtime_root() / project_id
 
 
 def _tm_runtime_path(state: dict, batch_num: Optional[int] = None) -> Path:
@@ -468,8 +1131,14 @@ def _tm_runtime_paths(state: dict) -> list[Path]:
         Path(path) for path in configured
         if isinstance(path, str)
     ] if isinstance(configured, list) else []
-    # Also discover files on disk so a recovered manifest or a manually
-    # repaired state cannot silently lose an already submitted batch.
+    # Protocol 10 shares submitted runtime TM across all files in the same
+    # toolkit project.  A document still owns its own batch files for
+    # provenance, but lookup intentionally spans sibling document directories.
+    runtime_root = _project_runtime_root()
+    if runtime_root.is_dir():
+        paths.extend(runtime_root.glob("*/_batch_*.json"))
+    # Also discover the configured directory for protocol-9 states so migrate
+    # can read their old data without silently losing a submitted batch.
     paths.extend(_tm_runtime_dir(state).glob("_batch_*.json"))
     unique: dict[str, Path] = {}
     for path in paths:
@@ -489,6 +1158,13 @@ def _tm_permanent_path(state: dict) -> Optional[Path]:
 def _tm_batch_number(path: Path) -> Optional[int]:
     match = re.search(r"_batch_(\d+)\.json$", path.name)
     return int(match.group(1)) if match else None
+
+
+def _tm_document_id(path: Path) -> Optional[str]:
+    try:
+        return path.parent.name if path.parent.parent.resolve() == _project_runtime_root().resolve() else None
+    except OSError:
+        return None
 
 
 def _entry_baseline(entry: dict) -> str:
@@ -554,19 +1230,29 @@ def _register_runtime_tm(state: dict, runtime_path: Path) -> None:
     )
 
 
-def _decorate_tm_match(match: dict, scope: str, batch_num: Optional[int] = None) -> dict:
+def _decorate_tm_match(
+    match: dict, scope: str, batch_num: Optional[int] = None,
+    document_id: Optional[str] = None,
+) -> dict:
     decorated = dict(match)
     decorated["tm_scope"] = scope
     if batch_num is not None:
         decorated["tm_batch"] = batch_num
+    if document_id is not None:
+        decorated["tm_document"] = document_id
     return decorated
 
 
-def _decorate_tm_fragment(match: dict, scope: str, batch_num: Optional[int] = None) -> dict:
+def _decorate_tm_fragment(
+    match: dict, scope: str, batch_num: Optional[int] = None,
+    document_id: Optional[str] = None,
+) -> dict:
     decorated = dict(match)
     decorated["tm_scope"] = scope
     if batch_num is not None:
         decorated["tm_batch"] = batch_num
+    if document_id is not None:
+        decorated["tm_document"] = document_id
     return decorated
 
 
@@ -578,11 +1264,11 @@ def _load_tm_layers(state: dict):
     if permanent_path and permanent_path.is_file():
         permanent = TranslationMemory(permanent_path)
         permanent.load()
-        layers.append(("permanent", None, permanent))
+        layers.append(("permanent", None, None, permanent))
     for runtime_path in _tm_runtime_paths(state):
         runtime = TranslationMemory(runtime_path)
         runtime.load()
-        layers.append(("runtime", _tm_batch_number(runtime_path), runtime))
+        layers.append(("runtime", _tm_batch_number(runtime_path), _tm_document_id(runtime_path), runtime))
     return layers
 
 
@@ -652,7 +1338,7 @@ def _enrich_working_json(json_path: Path, state: dict):
                     permanent_fragments = []
                     runtime_fragments_by_key = {}
                     matched_sources = set()
-                    for scope, batch_num, tm in layers:
+                    for scope, batch_num, document_id, tm in layers:
                         matches = tm.find_matches(plain, query_context=e.get("context", ""))
                         for match in matches:
                             decorated = _decorate_tm_match(
@@ -663,6 +1349,7 @@ def _enrich_working_json(json_path: Path, state: dict):
                                 },
                                 scope,
                                 batch_num,
+                                document_id,
                             )
                             matched_sources.add(match["source"])
                             if scope == "permanent":
@@ -689,13 +1376,21 @@ def _enrich_working_json(json_path: Path, state: dict):
                                     },
                                     scope,
                                     batch_num,
+                                    document_id,
                                 )
-                                key = decorated.get("fragment_source", "")
+                                key = (
+                                    decorated.get("fragment_source", ""),
+                                    decorated.get("match_target", ""),
+                                )
                                 if scope == "permanent":
                                     permanent_fragments.append(decorated)
                                 else:
                                     previous = runtime_fragments_by_key.get(key)
-                                    if previous is None or (batch_num or -1) >= (previous.get("tm_batch") or -1):
+                                    if previous is None or (
+                                        decorated.get("fragment_score", 0), batch_num or -1
+                                    ) > (
+                                        previous.get("fragment_score", 0), previous.get("tm_batch") or -1
+                                    ):
                                         runtime_fragments_by_key[key] = decorated
 
                     if permanent_matches:
@@ -710,7 +1405,11 @@ def _enrich_working_json(json_path: Path, state: dict):
                         e["tm_fragments"] = permanent_fragments
                     runtime_fragments = sorted(
                         runtime_fragments_by_key.values(),
-                        key=lambda item: -(item.get("tm_batch") or -1),
+                        key=lambda item: (
+                            -item.get("fragment_score", 0),
+                            -(item.get("supporting_files", 0)),
+                            -(item.get("tm_batch") or -1),
+                        ),
                     )
                     if runtime_fragments:
                         e["runtime_tm_fragments"] = runtime_fragments
@@ -724,6 +1423,25 @@ def _enrich_working_json(json_path: Path, state: dict):
             print(f"⚠️ tm_store 导入失败，跳过 TM 增强: {e}")
         except Exception as e:
             print(f"⚠️ TM 增强过程出错，跳过: {e}")
+
+    # One representation of inline layout is shared by translator, reviewer,
+    # and QA.  It is advisory task metadata; validation remains authoritative.
+    try:
+        validation_policy = state.get("validation_policy") or load_validation_policy(
+            state.get("validation_policy_path")
+        )
+        for entry in data.get("entries", []):
+            if not isinstance(entry.get("source"), str):
+                continue
+            layout = layout_metadata(
+                entry["source"], effective_entry_policy(validation_policy, entry.get("id", ""))["newline_policy"]
+            )
+            if layout:
+                entry["layout"] = layout
+            else:
+                entry.pop("layout", None)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"⚠️ 换行布局元数据生成失败，跳过: {exc}")
 
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -815,6 +1533,8 @@ def _build_review_json(
             item["runtime_tm_fragments"] = e["runtime_tm_fragments"]
         if isinstance(e.get("validation"), dict):
             item["validation"] = e["validation"]
+        if isinstance(e.get("layout"), dict):
+            item["layout"] = e["layout"]
         review_entries.append(item)
     review["entries"] = review_entries
     return review
@@ -851,9 +1571,24 @@ def cmd_init(
         print(f"❌ 源文件不存在: {source_path}")
         sys.exit(1)
     try:
-        validation_policy = load_validation_policy(validation_policy_path)
-        qa_policy = load_qa_policy(qa_policy_path)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        has_explicit_rules = validation_policy_path is not None or qa_policy_path is not None
+        current_rules = current_project_rules(_SCRIPT_DIR)
+        if current_rules and not has_explicit_rules:
+            rules_record = ensure_project_rules(_SCRIPT_DIR, None, None)
+        else:
+            requested_validation = load_validation_policy(validation_policy_path)
+            requested_qa = load_qa_policy(qa_policy_path)
+            rules_record = ensure_project_rules(
+                _SCRIPT_DIR,
+                requested_validation,
+                requested_qa,
+                sources={
+                    "validation_policy": str(validation_policy_path.resolve()) if validation_policy_path else None,
+                    "qa_policy": str(qa_policy_path.resolve()) if qa_policy_path else None,
+                },
+            )
+        validation_policy, qa_policy = _rules_policy_record(rules_record)
+    except (OSError, ValueError, json.JSONDecodeError, ProjectRulesError) as exc:
         print(f"❌ 项目策略无效: {exc}")
         sys.exit(1)
 
@@ -912,7 +1647,7 @@ def cmd_init(
         sys.exit(1)
 
     work_dir = _SCRIPT_DIR / "data" / stem
-    runtime_dir = (tm_runtime_dir or work_dir / "tm_runtime").resolve()
+    runtime_dir = (tm_runtime_dir or _project_runtime_root() / project_id).resolve()
     if permanent_tm_path:
         try:
             Path(permanent_tm_path).resolve().relative_to(runtime_dir)
@@ -930,17 +1665,10 @@ def cmd_init(
     }
     _write_json_atomic(_project_identity_path(project_id), identity)
 
-    policy_snapshots = _write_project_policy_snapshots(
-        project_id,
-        validation_policy,
-        qa_policy,
-        validation_policy_path,
-        qa_policy_path,
-    )
     reference_selection_snapshot = None
     if reference_selection is not None:
         reference_selection_snapshot = (
-            _project_rules_dir(project_id) / "reference_selection.json"
+            rules_root(_SCRIPT_DIR) / "reference_selections" / f"{project_id}.json"
         )
         _write_json_atomic(reference_selection_snapshot, reference_selection)
 
@@ -1039,11 +1767,12 @@ def cmd_init(
         "tm_runtime_files": [],
         "preserved_targets": preserved_targets,
         "style_guide_path": str(style_guide_path.resolve()) if style_guide_path else None,
-        "validation_policy_path": policy_snapshots["validation_policy_path"],
+        "validation_policy_path": rules_record["validation_policy_path"],
         "validation_policy": validation_policy,
-        "qa_policy_path": policy_snapshots["qa_policy_path"],
+        "qa_policy_path": rules_record["qa_policy_path"],
         "qa_policy": qa_policy,
-        "policy_manifest_path": policy_snapshots["policy_manifest_path"],
+        "project_rules_revision": rules_record["revision"],
+        "project_rules_current_path": str((rules_root(_SCRIPT_DIR) / "current.json").resolve()),
         "reference_selection_path": (
             str(reference_selection_snapshot.resolve())
             if reference_selection_snapshot is not None
@@ -1052,6 +1781,8 @@ def cmd_init(
         "qa_required": True,
         "require_agent_receipts": require_agent_receipts,
         "qa_status": "not_started",
+        "active_tasks": {},
+        "agent_attempts": {},
         "source_col": source_col,
         "target_col": target_col,
         "header_row": header_row,
@@ -1104,6 +1835,7 @@ def cmd_init(
 def cmd_next(review_only: bool = False, project_arg: Optional[str] = None):
     """输出当前批次的翻译 JSON（或校对 JSON，若 review_only=True）。"""
     state = _load_state(project_arg)
+    _require_current_rules(state)
 
     # 检查是否已完成
     batch_idx = state["current_batch"]
@@ -1166,13 +1898,19 @@ def cmd_next(review_only: bool = False, project_arg: Optional[str] = None):
             batch_num=batch_num,
             review_only=True,
         )
+        review["project_rules_revision"] = state.get("project_rules_revision")
         out_path = _SCRIPT_DIR / "exports" / state["stem"] / f"_batch_{batch_num:03d}_to_review.json"
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(review, f, ensure_ascii=False, indent=2)
 
         state["qa_status"] = "awaiting_review"
+        state["active_task_revision"] = state.get("project_rules_revision")
         state["qa_batch"] = batch_num
         state["qa_input_sha256"] = None
+        _set_active_task(
+            state, "trans-reviewer", out_path,
+            upstream_paths=(export_file,),
+        )
         _save_state(state)
 
         existing = sum(1 for e in review["entries"] if e["translated"])
@@ -1214,6 +1952,8 @@ def cmd_next(review_only: bool = False, project_arg: Optional[str] = None):
             item["tm_fragments"] = e["tm_fragments"]
         if e.get("runtime_tm_fragments"):
             item["runtime_tm_fragments"] = e["runtime_tm_fragments"]
+        if isinstance(e.get("layout"), dict):
+            item["layout"] = e["layout"]
         item["validation"] = effective_entry_policy(
             validation_policy, e["id"]
         )
@@ -1277,6 +2017,7 @@ def cmd_next(review_only: bool = False, project_arg: Optional[str] = None):
         batch["previous"] = context_entries
     batch["batch"] = batch_num
     batch["total_batches"] = state["total_batches"]
+    batch["project_rules_revision"] = state.get("project_rules_revision")
     batch["entries"] = batch_entries
 
     out_path = _SCRIPT_DIR / "exports" / state["stem"] / f"_batch_{batch_num:03d}_to_translate.json"
@@ -1284,8 +2025,10 @@ def cmd_next(review_only: bool = False, project_arg: Optional[str] = None):
         json.dump(batch, f, ensure_ascii=False, indent=2)
 
     state["qa_status"] = "awaiting_translation"
+    state["active_task_revision"] = state.get("project_rules_revision")
     state["qa_batch"] = batch_num
     state["qa_input_sha256"] = None
+    _set_active_task(state, "translator", out_path, upstream_paths=(export_file,))
     _save_state(state)
 
     print(f"📤 Batch {batch_num}/{state['total_batches']}  条目 {start + 1}-{end}（共 {total} 条）")
@@ -1384,6 +2127,7 @@ def cmd_submit(
 ):
     """Validate and commit one batch as a recoverable transaction."""
     state = _load_state(project_arg)
+    _require_current_rules(state)
     state_path = _project_state_path(state.get("project_id") or state["stem"])
 
     if (
@@ -1573,6 +2317,8 @@ def cmd_submit(
                 "qa_machine_findings",
             ):
                 state.pop(key, None)
+            state["active_tasks"] = {}
+            state["agent_attempts"] = {}
             state["current_batch"] += 1
             _register_runtime_tm(state, runtime_file)
             _save_state(state)
@@ -1639,6 +2385,7 @@ def cmd_submit(
 def cmd_review(result_path: Path, project_arg: Optional[str] = None):
     """将翻译结果与原文合并，生成校对 JSON。"""
     state = _load_state(project_arg)
+    _require_current_rules(state)
 
     # 读取当前批的翻译任务 JSON
     batch_num = state["current_batch"] + 1
@@ -1653,6 +2400,7 @@ def cmd_review(result_path: Path, project_arg: Optional[str] = None):
     if not result_path.is_file():
         print(f"❌ 结果文件不存在: {result_path}")
         sys.exit(1)
+    _require_active_task(state, "translator", batch_file)
     _require_agent_receipt(state, "translator", result_path)
     with open(result_path, "r", encoding="utf-8") as f:
         results = json.load(f)
@@ -1682,6 +2430,11 @@ def cmd_review(result_path: Path, project_arg: Optional[str] = None):
     state["qa_status"] = "awaiting_review"
     state["qa_batch"] = batch_num
     state["qa_input_sha256"] = None
+    state.get("active_tasks", {}).pop("translator", None)
+    _set_active_task(
+        state, "trans-reviewer", out_path,
+        upstream_paths=(batch_file,),
+    )
     _save_state(state)
 
     print(f"📝 校对文件已生成: {out_path.name}")
@@ -1740,9 +2493,29 @@ def _current_batch_all_entries(state: dict, export_data: dict, results: list[dic
     return all_entries
 
 
+def _run_complete_qa(
+    results: list[dict], expected_entries: list[dict], policy: dict,
+    all_entries: list[dict],
+) -> dict:
+    """Run immutable default QA and optional project findings together."""
+    outcome = run_qa(results, expected_entries, policy, all_entries=all_entries)
+    plugin_findings = run_qa_plugin(
+        policy.get("plugin"), results, expected_entries, outcome["findings"]
+    )
+    if plugin_findings:
+        outcome["findings"].extend(plugin_findings)
+        outcome["summary"] = {
+            "total": len(outcome["findings"]),
+            "by_rule": dict(Counter(item["rule"] for item in outcome["findings"])),
+            "by_severity": dict(Counter(item["severity"] for item in outcome["findings"])),
+        }
+    return outcome
+
+
 def cmd_qa(project_arg: Optional[str] = None):
     """Run deterministic QA and prepare the QA-agent task for the current batch."""
     state = _load_state(project_arg)
+    _require_current_rules(state)
     reviewed_path = _current_reviewed_path(state)
     if state.get("qa_status") not in {"awaiting_review", "pending_agent", "clean"}:
         print("❌ 当前批次尚未进入校对完成阶段，不能运行 QA")
@@ -1754,6 +2527,8 @@ def cmd_qa(project_arg: Optional[str] = None):
         print("⚠️ reviewed 基线已变化，丢弃旧 QA 任务并重新运行 QA")
 
     raw_results = _load_json_file(reviewed_path, "reviewed 文件")
+    review_task_path = _stage_input_path(state, "trans-reviewer")
+    _require_active_task(state, "trans-reviewer", review_task_path)
     _require_agent_receipt(state, "trans-reviewer", reviewed_path)
     results, warnings = _validate_submission(raw_results, state)
     if warnings:
@@ -1769,7 +2544,11 @@ def cmd_qa(project_arg: Optional[str] = None):
         sys.exit(1)
 
     all_entries = _current_batch_all_entries(state, export_data, results)
-    qa_result = run_qa(results, expected_entries, policy, all_entries=all_entries)
+    try:
+        qa_result = _run_complete_qa(results, expected_entries, policy, all_entries)
+    except RuntimeError as exc:
+        print(f"❌ QA 插件失败: {exc}")
+        sys.exit(1)
     batch_num = state["current_batch"] + 1
     result_map = {str(item["id"]): item["target"] for item in results}
     findings_by_id: dict[str, list[dict]] = {}
@@ -1786,6 +2565,15 @@ def cmd_qa(project_arg: Optional[str] = None):
         entry_id = str(item.get("id"))
         item["target"] = result_map.get(entry_id, item.get("target", item.get("translated", "")))
         item["findings"] = findings_by_id.get(entry_id, [])
+        validation = item.get("validation") if isinstance(item.get("validation"), dict) else {}
+        if isinstance(item.get("source"), str):
+            item["layout_preview"] = layout_preview(
+                item["source"], item["target"], validation.get("newline_policy", {
+                    "mode": "exact" if validation.get("enforce_newline_count") else "source_guided",
+                    "preserve_paragraphs": True,
+                    "forbid_edge_breaks": True,
+                })
+            )
         item.pop("translated", None)
         task_entries.append(item)
     task = {
@@ -1819,6 +2607,12 @@ def cmd_qa(project_arg: Optional[str] = None):
     state["qa_report_path"] = str(qa_report_path.resolve())
     state["qa_machine_findings"] = qa_result["findings"]
     state["qa_status"] = "clean" if not qa_result["findings"] else "pending_agent"
+    state.get("active_tasks", {}).pop("trans-reviewer", None)
+    if qa_result["findings"]:
+        _set_active_task(
+            state, "qa-reviewer", task_path,
+            upstream_paths=(reviewed_path,),
+        )
     _save_state(state)
     print(f"✅ QA 完成：{len(qa_result['findings'])} 个候选问题")
     print(f"   任务: {task_path}")
@@ -1836,6 +2630,7 @@ def cmd_qa_submit(
 ):
     """Validate QA-agent decisions, then commit the corrected batch transactionally."""
     state = _load_state(project_arg)
+    _require_current_rules(state)
     if state.get("qa_status") != "pending_agent":
         print("❌ 当前批次没有待处理的 QA 任务")
         sys.exit(1)
@@ -1845,6 +2640,7 @@ def cmd_qa_submit(
         sys.exit(1)
 
     task = _load_json_file(_current_qa_task_path(state), "QA 任务")
+    _require_active_task(state, "qa-reviewer", _current_qa_task_path(state))
     if not isinstance(task, dict):
         print("❌ QA 任务必须是 JSON 对象")
         sys.exit(1)
@@ -1901,7 +2697,11 @@ def cmd_qa_submit(
         qa_results,
     )
     all_entries = _current_batch_all_entries(state, export_data, qa_results)
-    recheck = run_qa(qa_results, expected_entries, policy, all_entries=all_entries)
+    try:
+        recheck = _run_complete_qa(qa_results, expected_entries, policy, all_entries)
+    except RuntimeError as exc:
+        print(f"❌ QA 插件失败: {exc}")
+        sys.exit(1)
     false_positive_ids = {
         str(item.get("finding_id"))
         for item in report.get("findings", [])
@@ -1934,6 +2734,36 @@ def cmd_qa_submit(
 # ═══════════════════════════════════════════════════════════════════════
 # status
 # ═══════════════════════════════════════════════════════════════════════
+
+def cmd_tm_debug(text: str, project_arg: Optional[str] = None) -> None:
+    """Explain permanent and shared-runtime fragment ranking for one source string."""
+    project_id = _resolve_project_id(project_arg)
+    state = _read_project_record(project_id)
+    if not state:
+        print("❌ 未找到项目 state 或 manifest")
+        sys.exit(1)
+    try:
+        from tm_store import display_tags
+        reports = []
+        for scope, batch_num, document_id, tm in _load_tm_layers(state):
+            analysis = tm.debug_fragment_matches(text)
+            reports.append({
+                "scope": scope,
+                "batch": batch_num,
+                "document": document_id,
+                "matches": [{
+                    **match,
+                    "match_source": display_tags(match["match_source"]),
+                    "match_target": display_tags(match["match_target"]),
+                } for match in analysis["matches"]],
+                "candidates": analysis["candidates"],
+                "rejected": analysis["rejected"],
+            })
+    except (OSError, ValueError) as exc:
+        print(f"❌ TM 调试失败: {exc}")
+        sys.exit(1)
+    print(json.dumps({"project": project_id, "text": text, "layers": reports}, ensure_ascii=False, indent=2))
+
 
 def cmd_status(project_arg: Optional[str] = None):
     """显示当前进度。"""
@@ -2676,7 +3506,7 @@ def main():
     p_init.add_argument("--terms", type=str, default=None, help="术语库 xlsx 路径")
     p_init.add_argument("--tm", type=str, default=None, help="永久 TM JSON 路径（兼容旧参数名）")
     p_init.add_argument("--tm-permanent", type=str, default=None, help="用户指定的永久/权威 TM JSON 路径")
-    p_init.add_argument("--tm-runtime-dir", type=str, default=None, help="运行期 TM 目录（默认 data/<project-id>/tm_runtime）")
+    p_init.add_argument("--tm-runtime-dir", type=str, default=None, help="运行期 TM 目录（默认 data/project_tm_runtime/<document-id>）")
     p_init.add_argument("--style-guide", type=str, default=None, help="风格指南 txt 路径")
     p_init.add_argument("--source-col", type=str, default="A", help="xlsx 源列（默认 A）")
     p_init.add_argument("--target-col", type=str, default="B", help="xlsx 目标列（默认 B）")
@@ -2791,6 +3621,30 @@ def main():
     p_receipt.add_argument("--input", required=True, type=Path, help="代理输入文件")
     p_receipt.add_argument("--output", required=True, type=Path, help="代理输出文件")
     add_project_argument(p_receipt)
+    p_attempt = sub.add_parser("agent-attempt", help="创建子代理隔离输出目录")
+    p_attempt.add_argument("stage", choices=tuple(sorted(_AGENT_STAGES)))
+    p_attempt.add_argument("--input", type=Path, default=None, help="context-analyzer 的输入；其余阶段自动绑定当前任务")
+    p_attempt.add_argument("--attempt-id", type=str, default=None)
+    p_attempt.add_argument("--output-name", type=str, default=None, help="context-analyzer 的已晋升输出文件名")
+    p_attempt.add_argument(
+        "--execution-surface", choices=tuple(sorted(_EXECUTION_SURFACES)),
+        default="unspecified", help="启动子代理的 Codex 表面，用于 receipt 审计",
+    )
+    add_project_argument(p_attempt)
+    p_complete = sub.add_parser(
+        "agent-complete", help="验证稳定暂存输出并记录当前 attempt 的完成事件"
+    )
+    p_complete.add_argument("stage", choices=tuple(sorted(_AGENT_STAGES)))
+    p_complete.add_argument("--attempt-dir", required=True, type=Path)
+    p_complete.add_argument("--agent-id", required=True, type=str)
+    add_project_argument(p_complete)
+    p_promote = sub.add_parser("promote", help="晋升已完成的子代理 attempt 并生成 receipt v2")
+    p_promote.add_argument("stage", choices=tuple(sorted(_AGENT_STAGES)))
+    p_promote.add_argument("--attempt-dir", required=True, type=Path)
+    p_promote.add_argument("--agent-id", required=True, type=str)
+    p_promote.add_argument("--role-config", required=True, type=Path)
+    p_promote.add_argument("--completion-event", required=True, type=Path)
+    add_project_argument(p_promote)
     p_version = sub.add_parser("version", help="显示工具包与工作流协议版本")
     p_version.add_argument("--json", action="store_true", help="以 JSON 输出")
     p_context_split = sub.add_parser("context-split", help="生成语境分析分片")
@@ -2803,6 +3657,23 @@ def main():
     p_context_pack.add_argument("reports", nargs="+", type=Path, help="按顺序排列的分片报告")
     p_context_pack.add_argument("--out", type=str, default=None, help="合并任务 JSON 路径")
     add_project_argument(p_context_pack)
+    p_tm_debug = sub.add_parser("tm-debug", help="显示 TM 片段候选、评分与淘汰原因")
+    p_tm_debug.add_argument("--text", required=True, type=str, help="待查询的日文 source")
+    add_project_argument(p_tm_debug)
+    p_project_config = sub.add_parser("project-config", help="管理共享项目规则 revision")
+    project_config_sub = p_project_config.add_subparsers(dest="project_config_command", required=True)
+    for name, help_text in (
+        ("init", "创建首次共享项目规则"),
+        ("update", "升级共享规则并使活动任务失效"),
+    ):
+        command = project_config_sub.add_parser(name, help=help_text)
+        command.add_argument("--validation-policy", type=Path, default=None)
+        command.add_argument("--qa-policy", type=Path, default=None)
+        command.add_argument("--qa-plugin", type=Path, default=None)
+        if name == "update":
+            command.add_argument("--clear-qa-plugin", action="store_true")
+    project_config_sub.add_parser("show", help="显示当前共享规则 revision")
+    project_config_sub.add_parser("migrate", help="迁移 protocol-9 文件级规则和运行期 TM")
 
     args = parser.parse_args()
 
@@ -2872,6 +3743,28 @@ def main():
             args.output,
             args.project,
         )
+    elif args.command == "agent-attempt":
+        cmd_agent_attempt(
+            args.stage,
+            args.input,
+            args.project,
+            attempt_id=args.attempt_id,
+            output_name=args.output_name,
+            execution_surface=args.execution_surface,
+        )
+    elif args.command == "agent-complete":
+        cmd_agent_complete(
+            args.stage, args.attempt_dir, args.agent_id, args.project,
+        )
+    elif args.command == "promote":
+        cmd_promote(
+            args.stage,
+            args.attempt_dir,
+            args.agent_id,
+            args.role_config,
+            args.completion_event,
+            args.project,
+        )
     elif args.command == "version":
         version_info = {
             "toolkit_version": TOOLKIT_VERSION,
@@ -2889,6 +3782,20 @@ def main():
         cmd_context_split(args.max_chars, args.project)
     elif args.command == "context-pack":
         cmd_context_pack(args.reports, args.out, args.project)
+    elif args.command == "tm-debug":
+        cmd_tm_debug(args.text, args.project)
+    elif args.command == "project-config":
+        if args.project_config_command == "init":
+            cmd_project_config_init(args.validation_policy, args.qa_policy, args.qa_plugin)
+        elif args.project_config_command == "show":
+            cmd_project_config_show()
+        elif args.project_config_command == "update":
+            cmd_project_config_update(
+                args.validation_policy, args.qa_policy, args.qa_plugin,
+                args.clear_qa_plugin,
+            )
+        elif args.project_config_command == "migrate":
+            cmd_project_config_migrate()
     else:
         parser.print_help()
 

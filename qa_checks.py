@@ -5,17 +5,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import subprocess
+import sys
+import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
+
+from layout import layout_preview, suspicious_newline_warnings, validate_newline_semantics
 
 
 DEFAULT_QA_POLICY: dict[str, Any] = {
     "rules": {
         "tm_exact_target_mismatch": {"enabled": True, "severity": "error"},
         "protected_token_parity": {"enabled": True, "severity": "error"},
-        "number_parity": {"enabled": True, "severity": "warning"},
+        "number_parity": {
+            "enabled": True, "severity": "warning", "comparison": "numeric_value",
+        },
         "url_email_parity": {"enabled": True, "severity": "error"},
         "whitespace": {"enabled": True, "severity": "warning"},
         "punctuation_balance": {"enabled": True, "severity": "warning"},
@@ -24,6 +32,8 @@ DEFAULT_QA_POLICY: dict[str, Any] = {
         "term_consistency": {"enabled": True, "severity": "warning"},
         "duplicate_consistency": {"enabled": True, "severity": "warning"},
         "newline_count": {"enabled": False, "severity": "warning"},
+        "newline_semantics": {"enabled": True, "severity": "error"},
+        "newline_suspicious_break": {"enabled": True, "severity": "warning"},
     },
     "protected_patterns": [
         r"\$\{[^{}]+\}",
@@ -34,16 +44,19 @@ DEFAULT_QA_POLICY: dict[str, Any] = {
     "length_ratio": {"min": 0.25, "max": 3.0, "min_source_chars": 4},
     "ignore_rule_ids": [],
     "entry_overrides": {},
+    "plugin": None,
 }
 
 _RULE_IDS = set(DEFAULT_QA_POLICY["rules"])
-_RULE_KEYS = {"enabled", "severity"}
+_RULE_KEYS = {"enabled", "severity", "comparison"}
 _SEVERITIES = {"error", "warning", "info"}
 _TOP_LEVEL_KEYS = set(DEFAULT_QA_POLICY)
 _ENTRY_OVERRIDE_KEYS = {"disabled_rules", "rules"}
 _TAG_RE = re.compile(r"<tag\b[^<>]*/>")
 _BARE_TAG_RE = re.compile(r"<\/?[a-zA-Z][^>]*>")
-_NUMBER_RE = re.compile(r"(?<![\w])\d+(?:[.,]\d+)?%?")
+_NUMBER_RE = re.compile(r"(?<!\d)\d+(?:[.,]\d+)?%?")
+_CHINESE_NUMBER_RE = re.compile(r"[零〇一二三四五六七八九十百千万亿兆两]+%?")
+_CHINESE_PERCENT_RE = re.compile(r"百分之[零〇一二三四五六七八九十百千万亿兆两]+")
 _URL_EMAIL_RE = re.compile(
     r"(?:https?://|ftp://|www\.)[^\s<>\"']+"
     r"|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}"
@@ -114,6 +127,11 @@ def _validate_qa_policy(policy: dict[str, Any]) -> None:
             raise ValueError(f"QA 规则 {rule_id}.enabled 必须是 boolean")
         if config.get("severity", "warning") not in _SEVERITIES:
             raise ValueError(f"QA 规则 {rule_id}.severity 无效")
+        if "comparison" in config:
+            if rule_id != "number_parity" or config["comparison"] not in {
+                "literal", "numeric_value"
+            }:
+                raise ValueError(f"QA 规则 {rule_id}.comparison 无效")
 
     patterns = policy.get("protected_patterns")
     if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
@@ -164,6 +182,23 @@ def _validate_qa_policy(policy: dict[str, Any]) -> None:
                 raise ValueError(f"QA entry_overrides.{entry_id}.rules.{rule_id}.enabled 必须是 boolean")
             if config.get("severity", "warning") not in _SEVERITIES:
                 raise ValueError(f"QA entry_overrides.{entry_id}.rules.{rule_id}.severity 无效")
+            if "comparison" in config and (
+                rule_id != "number_parity"
+                or config["comparison"] not in {"literal", "numeric_value"}
+            ):
+                raise ValueError(
+                    f"QA entry_overrides.{entry_id}.rules.{rule_id}.comparison 无效"
+                )
+
+    plugin = policy.get("plugin")
+    if plugin is not None:
+        if not isinstance(plugin, dict) or set(plugin) - {"path", "timeout_seconds"}:
+            raise ValueError("QA 策略 plugin 字段无效")
+        if not isinstance(plugin.get("path"), str) or not plugin["path"].strip():
+            raise ValueError("QA 策略 plugin.path 必须是非空字符串")
+        timeout = plugin.get("timeout_seconds", 30)
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= 300:
+            raise ValueError("QA 策略 plugin.timeout_seconds 必须是 1 到 300 的整数")
 
 
 def effective_qa_policy(policy: dict[str, Any], entry_id: str | int) -> dict[str, Any]:
@@ -174,6 +209,7 @@ def effective_qa_policy(policy: dict[str, Any], entry_id: str | int) -> dict[str
         "rules": {rule_id: dict(config) for rule_id, config in policy["rules"].items()},
         "protected_patterns": list(policy["protected_patterns"]),
         "length_ratio": dict(policy["length_ratio"]),
+        "plugin": dict(policy["plugin"]) if policy.get("plugin") else None,
     }
     for rule_id in policy.get("ignore_rule_ids", []):
         resolved["rules"].setdefault(rule_id, {})["enabled"] = False
@@ -233,6 +269,78 @@ def _token_counter(text: str, patterns: list[str]) -> Counter[str]:
     return Counter(values)
 
 
+_CHINESE_DIGITS = {
+    "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3,
+    "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+}
+_CHINESE_SMALL_UNITS = {"十": 10, "百": 100, "千": 1000}
+_CHINESE_LARGE_UNITS = {"万": 10_000, "亿": 100_000_000, "兆": 1_000_000_000_000}
+
+
+def _chinese_number_value(text: str) -> int | None:
+    """Parse common integer Chinese numerals, including digit sequences."""
+    value = text.rstrip("％%")
+    if not value:
+        return None
+    if all(char in _CHINESE_DIGITS for char in value):
+        return int("".join(str(_CHINESE_DIGITS[char]) for char in value))
+
+    total = section = number = 0
+    for char in value:
+        if char in _CHINESE_DIGITS:
+            number = _CHINESE_DIGITS[char]
+        elif char in _CHINESE_SMALL_UNITS:
+            section += (number or 1) * _CHINESE_SMALL_UNITS[char]
+            number = 0
+        elif char in _CHINESE_LARGE_UNITS:
+            section += number
+            total += (section or 1) * _CHINESE_LARGE_UNITS[char]
+            section = number = 0
+        else:
+            return None
+    return total + section + number
+
+
+def _canonical_number(token: str) -> str:
+    normalized = unicodedata.normalize("NFKC", token)
+    percent = normalized.endswith("%")
+    body = normalized[:-1] if percent else normalized
+    if body.isdigit():
+        value = str(int(body))
+    else:
+        parsed = _chinese_number_value(body)
+        value = body if parsed is None else str(parsed)
+    return f"{value}%" if percent else value
+
+
+def _number_counter(
+    text: str, allow_chinese: bool = False, numeric_value: bool = True,
+) -> Counter[str]:
+    normalized_text = unicodedata.normalize("NFKC", text)
+    matches = list(_NUMBER_RE.finditer(normalized_text))
+    result = Counter(
+        _canonical_number(match.group(0)) if numeric_value else match.group(0)
+        for match in matches
+    )
+    if not allow_chinese:
+        return result
+    occupied = [(match.start(), match.end()) for match in matches]
+    for match in _CHINESE_PERCENT_RE.finditer(normalized_text):
+        if any(match.start() < end and start < match.end() for start, end in occupied):
+            continue
+        parsed = _chinese_number_value(match.group(0)[3:])
+        if parsed is not None:
+            result[f"{parsed}%"] += 1
+            occupied.append((match.start(), match.end()))
+    for match in _CHINESE_NUMBER_RE.finditer(normalized_text):
+        if any(match.start() < end and start < match.end() for start, end in occupied):
+            continue
+        canonical = _canonical_number(match.group(0))
+        if canonical != match.group(0):
+            result[canonical] += 1
+    return result
+
+
 def _brackets_balanced(text: str) -> bool:
     stack: list[str] = []
     for char in text:
@@ -258,6 +366,79 @@ def _append_if_enabled(findings: list[dict], policy: dict, entry: dict, rule: st
     enabled, severity = _rule_enabled(policy, entry, rule)
     if enabled:
         findings.append(_make_finding(rule, severity, entry, message, **extra))
+
+
+def run_qa_plugin(
+    plugin: dict[str, Any] | None,
+    results: list[dict],
+    expected_entries: list[dict],
+    existing_findings: list[dict],
+) -> list[dict]:
+    """Run an optional project QA plugin that can only add validated findings."""
+    if not plugin:
+        return []
+    plugin_path = Path(plugin["path"])
+    if not plugin_path.is_file():
+        raise RuntimeError(f"QA 插件不存在: {plugin_path}")
+    payload = {
+        "schema_version": 1,
+        "results": results,
+        "entries": expected_entries,
+        "default_findings": existing_findings,
+    }
+    env = {"PYTHONIOENCODING": "utf-8", "PATH": os.environ.get("PATH", "")}
+    for key in ("SYSTEMROOT", "WINDIR", "COMSPEC"):
+        if os.environ.get(key):
+            env[key] = os.environ[key]
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-I", str(plugin_path)],
+            input=json.dumps(payload, ensure_ascii=False),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            env=env,
+            timeout=plugin.get("timeout_seconds", 30),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"QA 插件超时: {plugin_path}") from exc
+    if completed.returncode:
+        raise RuntimeError(
+            f"QA 插件失败 ({completed.returncode}): {completed.stderr.strip()[:500]}"
+        )
+    try:
+        output = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("QA 插件 stdout 必须是 JSON 对象") from exc
+    if not isinstance(output, dict) or set(output) != {"findings"}:
+        raise RuntimeError("QA 插件输出只能包含 findings")
+    raw_findings = output["findings"]
+    if not isinstance(raw_findings, list):
+        raise RuntimeError("QA 插件 findings 必须是数组")
+    by_id = {str(entry.get("id")): entry for entry in expected_entries}
+    findings = []
+    for index, raw in enumerate(raw_findings):
+        if not isinstance(raw, dict) or set(raw) - {"id", "rule", "severity", "message", "details"}:
+            raise RuntimeError(f"QA 插件 finding #{index + 1} 字段无效")
+        entry_id = str(raw.get("id", ""))
+        if entry_id not in by_id:
+            raise RuntimeError(f"QA 插件 finding #{index + 1} 引用了批外 id")
+        rule = raw.get("rule")
+        severity = raw.get("severity")
+        message = raw.get("message")
+        if not isinstance(rule, str) or not rule.strip() or severity not in _SEVERITIES or not isinstance(message, str):
+            raise RuntimeError(f"QA 插件 finding #{index + 1} 内容无效")
+        details = raw.get("details", {})
+        if not isinstance(details, dict):
+            raise RuntimeError(f"QA 插件 finding #{index + 1}.details 必须是对象")
+        finding = _make_finding(
+            f"plugin:{rule}", severity, by_id[entry_id], message,
+            plugin_rule=rule, **details,
+        )
+        finding["plugin"] = True
+        findings.append(finding)
+    return findings
 
 
 def run_qa(
@@ -338,14 +519,22 @@ def run_qa(
                     source_tokens=dict(source_tokens), target_tokens=dict(target_tokens),
                 )
 
+        number_config = effective_qa_policy(policy, entry.get("id", ""))["rules"].get(
+            "number_parity", {}
+        )
         if _rule_enabled(policy, entry, "number_parity")[0]:
-            source_numbers = Counter(_NUMBER_RE.findall(source_plain))
-            target_numbers = Counter(_NUMBER_RE.findall(target_plain))
+            numeric_value = number_config.get("comparison", "numeric_value") == "numeric_value"
+            source_numbers = _number_counter(source_plain, numeric_value=numeric_value)
+            target_numbers = _number_counter(
+                target_plain, allow_chinese=bool(source_numbers) and numeric_value,
+                numeric_value=numeric_value,
+            )
             if source_numbers != target_numbers:
                 _append_if_enabled(
                     findings, policy, entry, "number_parity",
                     "数字或百分比与 source 不一致",
                     source_numbers=dict(source_numbers), target_numbers=dict(target_numbers),
+                    comparison=number_config.get("comparison", "numeric_value"),
                 )
 
         if _rule_enabled(policy, entry, "url_email_parity")[0]:
@@ -366,6 +555,25 @@ def run_qa(
                 "译文换行数量与 source 不一致",
                 source_newlines=source_newlines,
                 target_newlines=target_newlines,
+            )
+
+        validation = entry.get("validation") if isinstance(entry.get("validation"), dict) else {}
+        newline_policy = validation.get("newline_policy") if isinstance(validation, dict) else None
+        if not isinstance(newline_policy, dict):
+            newline_policy = {
+                "mode": "exact" if validation.get("enforce_newline_count") else "source_guided",
+                "preserve_paragraphs": True,
+                "forbid_edge_breaks": True,
+            }
+        for issue in validate_newline_semantics(source, target, newline_policy):
+            _append_if_enabled(
+                findings, policy, entry, "newline_semantics", "译文换行布局无效: " + issue,
+                layout=layout_preview(source, target, newline_policy),
+            )
+        for issue in suspicious_newline_warnings(target):
+            _append_if_enabled(
+                findings, policy, entry, "newline_suspicious_break", "译文换行位置可疑: " + issue,
+                layout=layout_preview(source, target, newline_policy),
             )
 
         if _has_whitespace_issue(source_plain, target_plain):
@@ -472,6 +680,10 @@ def validate_qa_report(
         str(finding.get("finding_id")): str(finding.get("id"))
         for finding in machine_findings
     }
+    finding_rules = {
+        str(finding.get("finding_id")): str(finding.get("rule"))
+        for finding in machine_findings
+    }
     seen: set[str] = set()
     baseline_map = {str(item.get("id")): item.get("target", "") for item in baseline_results}
     result_map = {str(item.get("id")): item.get("target", "") for item in qa_results}
@@ -513,6 +725,8 @@ def validate_qa_report(
             continue
         if status == "fixed" and current == baseline:
             errors.append(f"QA finding 标记 fixed 但 target 未改变: {finding_id}")
+        if status == "false_positive" and finding_rules[finding_id] == "newline_semantics":
+            errors.append(f"结构性换行 finding 必须修复，不能标记 false_positive: {finding_id}")
         if (
             status == "false_positive"
             and current != baseline

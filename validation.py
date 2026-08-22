@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from layout import layout_metadata, validate_newline_semantics
+
 
 TAG_TOKEN_RE = re.compile(r"<tag\b[^<>]*/>")
 TAG_ATTR_RE = re.compile(r"\b(id|type|desc)\s*=\s*(['\"])(.*?)\2")
@@ -20,6 +22,11 @@ DEFAULT_POLICY: dict[str, Any] = {
     "tag_mode": "exact",
     "enforce_maxlength": True,
     "enforce_newline_count": False,
+    "newline_policy": {
+        "mode": "source_guided",
+        "preserve_paragraphs": True,
+        "forbid_edge_breaks": True,
+    },
     "allow_empty_ids": [],
     "entry_overrides": {},
 }
@@ -31,6 +38,7 @@ _OVERRIDE_KEYS = {
     "tag_mode",
     "enforce_maxlength",
     "enforce_newline_count",
+    "newline_policy",
     "allow_empty",
 }
 
@@ -55,6 +63,7 @@ def load_validation_policy(path: str | Path | None = None) -> dict[str, Any]:
             DEFAULT_POLICY["forbidden_target_tag_types"]
         ),
         "allow_empty_ids": list(DEFAULT_POLICY["allow_empty_ids"]),
+        "newline_policy": dict(DEFAULT_POLICY["newline_policy"]),
         "entry_overrides": {},
     }
     if not path:
@@ -72,6 +81,13 @@ def load_validation_policy(path: str | Path | None = None) -> dict[str, Any]:
     if unknown:
         raise ValueError(f"验证策略含未知字段: {sorted(unknown)}")
     policy.update(custom)
+    # Protocol 9 policies only carried a boolean.  Preserve their intended
+    # strictness while making flexible wrapping semantically checked in v10.
+    if "newline_policy" not in custom:
+        policy["newline_policy"] = {
+            **DEFAULT_POLICY["newline_policy"],
+            "mode": "exact" if custom.get("enforce_newline_count") else "source_guided",
+        }
     _validate_policy(policy)
     return policy
 
@@ -83,8 +99,7 @@ def validate_batch_results(
 ) -> ValidationResult:
     """Validate reviewed output against the exact current-batch contract."""
     result = ValidationResult()
-    policy = policy or load_validation_policy()
-    _validate_policy(policy)
+    policy = _normalise_policy(policy)
 
     if isinstance(data, dict) and "entries" in data:
         result.warnings.append("输出包装为 {entries:[...]}，已自动解包")
@@ -194,9 +209,10 @@ def validate_batch_results(
                 f"{sorted(set(forbidden_found))}"
             )
 
-        if entry_policy.get("enforce_newline_count"):
-            if source.count("\n") != target.count("\n"):
-                result.fatal.append(f"id={entry_id} 的换行数量与 source 不一致")
+        for issue in validate_newline_semantics(
+            source, target, entry_policy["newline_policy"]
+        ):
+            result.fatal.append(f"id={entry_id} 的换行布局无效: {issue}")
 
         if entry_policy.get("enforce_maxlength") and expected.get("maxlengthchars"):
             try:
@@ -219,7 +235,7 @@ def audit_preserved_entries(
     entries: list[dict], policy: dict[str, Any] | None = None
 ) -> list[dict[str, Any]]:
     """Report legacy target-format risks without affecting submit eligibility."""
-    policy = policy or load_validation_policy()
+    policy = _normalise_policy(policy)
     _validate_policy(policy)
     findings: list[dict[str, Any]] = []
     for entry in entries:
@@ -291,6 +307,7 @@ def effective_entry_policy(
     policy: dict[str, Any], entry_id: str | int
 ) -> dict[str, Any]:
     """Return the fully resolved validation contract for one entry."""
+    policy = _normalise_policy(policy)
     entry_id = str(entry_id)
     merged = {
         "ignored_tag_types": list(policy.get("ignored_tag_types", [])),
@@ -300,12 +317,17 @@ def effective_entry_policy(
         "tag_mode": policy.get("tag_mode", "exact"),
         "enforce_maxlength": bool(policy.get("enforce_maxlength", True)),
         "enforce_newline_count": bool(policy.get("enforce_newline_count", False)),
+        "newline_policy": dict(policy.get("newline_policy", DEFAULT_POLICY["newline_policy"])),
         "allow_empty": entry_id in {
             str(value) for value in policy.get("allow_empty_ids", [])
         },
     }
     override = policy.get("entry_overrides", {}).get(entry_id, {})
     merged.update(override)
+    if "newline_policy" not in override and merged["enforce_newline_count"]:
+        merged["newline_policy"] = {
+            **merged["newline_policy"], "mode": "exact"
+        }
     return merged
 
 
@@ -331,6 +353,7 @@ def _validate_policy(policy: dict[str, Any]) -> None:
     for key in ("enforce_maxlength", "enforce_newline_count"):
         if not isinstance(policy.get(key), bool):
             raise ValueError(f"{key} 必须是 JSON boolean")
+    _validate_newline_policy(policy.get("newline_policy"), "newline_policy")
     overrides = policy.get("entry_overrides", {})
     if not isinstance(overrides, dict):
         raise ValueError("entry_overrides 必须是对象")
@@ -356,8 +379,50 @@ def _validate_policy(policy: dict[str, Any]) -> None:
                 raise ValueError(
                     f"entry_overrides.{entry_id}.{list_key} 必须是数组"
                 )
+        if "newline_policy" in override:
+            _validate_newline_policy(
+                override["newline_policy"], f"entry_overrides.{entry_id}.newline_policy"
+            )
         for key in ("enforce_maxlength", "enforce_newline_count", "allow_empty"):
             if key in override and not isinstance(override[key], bool):
                 raise ValueError(
                     f"entry_overrides.{entry_id}.{key} 必须是 JSON boolean"
                 )
+
+
+def _validate_newline_policy(value: Any, label: str) -> None:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} 必须是对象")
+    allowed = {"mode", "preserve_paragraphs", "forbid_edge_breaks"}
+    unknown = set(value) - allowed
+    if unknown:
+        raise ValueError(f"{label} 含未知字段: {sorted(unknown)}")
+    if value.get("mode") not in {"exact", "source_guided", "free"}:
+        raise ValueError(f"{label}.mode 必须是 exact、source_guided 或 free")
+    for key in ("preserve_paragraphs", "forbid_edge_breaks"):
+        if not isinstance(value.get(key), bool):
+            raise ValueError(f"{label}.{key} 必须是 JSON boolean")
+
+
+def _normalise_policy(policy: dict[str, Any] | None) -> dict[str, Any]:
+    """Fill protocol-9 policy dictionaries before validating their v10 form."""
+    if policy is None:
+        return load_validation_policy()
+    resolved = {
+        "ignored_tag_types": list(DEFAULT_POLICY["ignored_tag_types"]),
+        "forbidden_target_tag_types": list(DEFAULT_POLICY["forbidden_target_tag_types"]),
+        "tag_mode": DEFAULT_POLICY["tag_mode"],
+        "enforce_maxlength": DEFAULT_POLICY["enforce_maxlength"],
+        "enforce_newline_count": DEFAULT_POLICY["enforce_newline_count"],
+        "newline_policy": dict(DEFAULT_POLICY["newline_policy"]),
+        "allow_empty_ids": [],
+        "entry_overrides": {},
+    }
+    resolved.update(policy)
+    if "newline_policy" not in policy:
+        resolved["newline_policy"] = {
+            **DEFAULT_POLICY["newline_policy"],
+            "mode": "exact" if resolved["enforce_newline_count"] else "source_guided",
+        }
+    _validate_policy(resolved)
+    return resolved

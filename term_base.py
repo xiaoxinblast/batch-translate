@@ -92,8 +92,17 @@ class TermBase:
                 )
                 pos = idx + len(ja)
 
+        seen: set[tuple[str, str, str]] = set()
         for entries in matched_spans.values():
-            results.extend(entries)
+            for entry in entries:
+                # A term is a constraint, not an occurrence counter.  Repeated
+                # appearances in one source sentence should not duplicate the
+                # same instruction for the translator.  Genuine same-source,
+                # different-target entries remain distinct.
+                key = (entry["ja"], entry["zh"], entry["note"])
+                if key not in seen:
+                    seen.add(key)
+                    results.append(entry)
         return results
 
 

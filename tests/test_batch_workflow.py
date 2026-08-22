@@ -1,5 +1,6 @@
 """批处理事务、独立导出和用户源文件只读的端到端测试。"""
 
+import io
 import json
 import shutil
 import sys
@@ -245,7 +246,7 @@ class BatchWorkflowTest(unittest.TestCase):
         )
         batch.cmd_submit(result)
 
-        runtime = self.tool / "data" / "mixed" / "tm_runtime" / "_batch_001.json"
+        runtime = self.tool / "data" / "project_tm_runtime" / "mixed" / "_batch_001.json"
         runtime_entries = json.loads(runtime.read_text(encoding="utf-8"))["entries"]
         self.assertEqual(len(runtime_entries), 1)
         self.assertEqual(runtime_entries[0]["source"], "二")
@@ -313,7 +314,7 @@ class BatchWorkflowTest(unittest.TestCase):
         batch.cmd_rebuild_runtime_tm("runtime-rebuild")
 
         state = self._state("runtime-rebuild")
-        runtime_dir = self.tool / "data" / "runtime-rebuild" / "tm_runtime"
+        runtime_dir = self.tool / "data" / "project_tm_runtime" / "runtime-rebuild"
         batch_1 = runtime_dir / "_batch_001.json"
         batch_2 = runtime_dir / "_batch_002.json"
         self.assertEqual(state["tm_runtime_files"], [str(batch_1.resolve())])
@@ -376,7 +377,7 @@ class BatchWorkflowTest(unittest.TestCase):
         self.assertEqual(state["qa_status"], "awaiting_translation")
         self.assertEqual(state["current_batch"], 0)
 
-    def test_required_translator_receipt_blocks_review_until_recorded(self):
+    def test_required_translator_receipt_requires_attempt_promote_v2(self):
         source = self.base / "receipt.txt"
         source.write_text("原文\n", encoding="utf-8")
         selection = self.base / "reference-selection.json"
@@ -418,13 +419,213 @@ class BatchWorkflowTest(unittest.TestCase):
         )
         with self.assertRaises(SystemExit):
             batch.cmd_receipt(
-                "translator", "/root/translator_wrong", wrong_role, task, result, "receipt"
+                "translator", "/root/translator_001", role, task, result, "receipt"
             )
 
-        batch.cmd_receipt(
-            "translator", "/root/translator_001", role, task, result, "receipt"
+        attempt = batch.cmd_agent_attempt(
+            "translator", None, "receipt", attempt_id="attempt_001",
+            execution_surface="app",
         )
-        batch.cmd_review(result, "receipt")
+        attempt_task = json.loads(Path(attempt["agent_input"]).read_text(encoding="utf-8"))
+        self.assertEqual(attempt_task["agent_attempt"]["outputs"]["result"], attempt["outputs"]["result"])
+        self.assertEqual(attempt["agent_input_sha256"], batch._sha256_file(Path(attempt["agent_input"])))
+        staged_result = Path(attempt["outputs"]["result"])
+        staged_result.write_text(result.read_text(encoding="utf-8"), encoding="utf-8")
+        manual_event = self.base / "translator-completed.json"
+        manual_event.write_text(
+            json.dumps({
+                "schema_version": 1,
+                "event": "agent_completed",
+                "status": "completed",
+                "agent_id": "/root/translator_001",
+                "attempt_id": "attempt_001",
+                "exit_code": 0,
+                "outputs": {"result": batch._sha256_file(staged_result)},
+            }),
+            encoding="utf-8",
+        )
+        with self.assertRaises(SystemExit):
+            batch.cmd_promote(
+                "translator", Path(attempt["outputs"]["result"]).parent,
+                "/root/translator_001", role, manual_event, "receipt",
+            )
+        event = batch.cmd_agent_complete(
+            "translator", Path(attempt["outputs"]["result"]).parent,
+            "/root/translator_001", "receipt",
+        )
+        with self.assertRaises(SystemExit):
+            batch.cmd_promote(
+                "translator", Path(attempt["outputs"]["result"]).parent,
+                "/root/translator_001", wrong_role, event, "receipt",
+            )
+        batch.cmd_promote(
+            "translator", Path(attempt["outputs"]["result"]).parent,
+            "/root/translator_001", role, event, "receipt",
+        )
+        canonical_result = Path(attempt["destinations"]["result"])
+        receipt = json.loads(
+            (self.tool / "exports" / "receipt" / "receipts" / "_batch_001_translator.json")
+            .read_text(encoding="utf-8")
+        )
+        self.assertEqual(receipt["schema_version"], 2)
+        self.assertEqual(receipt["execution_surface"], "app")
+        self.assertEqual(receipt["outputs"][0]["sha256"], batch._sha256_file(canonical_result))
+        batch.cmd_review(canonical_result, "receipt")
+
+    def test_qa_promote_is_a_two_file_receipt_transaction(self):
+        source = self.base / "qa-promote.txt"
+        source.write_text("こんにちは\n", encoding="utf-8")
+        selection = self.base / "qa-promote-selection.json"
+        selection.write_text(json.dumps({
+            "approved": True,
+            "style_guide": None,
+            "terms": None,
+            "tm_permanent": None,
+            "validation_policy": None,
+            "qa_policy": None,
+        }), encoding="utf-8")
+        translator_role = self.base / "translator-promote.toml"
+        reviewer_role = self.base / "reviewer-promote.toml"
+        qa_role = self.base / "qa-promote.toml"
+        translator_role.write_text(
+            'name = "translator"\nmodel = "gpt-5.6-terra"\nmodel_reasoning_effort = "max"\n',
+            encoding="utf-8",
+        )
+        reviewer_role.write_text(
+            'name = "trans-reviewer"\nmodel = "gpt-5.6-terra"\nmodel_reasoning_effort = "max"\n',
+            encoding="utf-8",
+        )
+        qa_role.write_text(
+            'name = "qa-reviewer"\nmodel = "gpt-5.6-luna"\nmodel_reasoning_effort = "max"\n',
+            encoding="utf-8",
+        )
+        batch.cmd_init(source, require_agent_receipts=True, reference_selection_path=selection)
+        batch.cmd_next()
+
+        def promote(stage, role, payloads):
+            attempt = batch.cmd_agent_attempt(stage, None, "qa-promote")
+            for name, value in payloads.items():
+                output = Path(attempt["outputs"][name])
+                output.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+            event = batch.cmd_agent_complete(
+                stage, Path(attempt["outputs"]["result"]).parent,
+                f"/root/{stage}", "qa-promote",
+            )
+            batch.cmd_promote(
+                stage, Path(attempt["outputs"]["result"]).parent,
+                f"/root/{stage}", role, event, "qa-promote",
+            )
+            return attempt
+
+        translated = promote("translator", translator_role, {
+            "result": [{"id": "1", "target": "こんにちは"}],
+        })
+        batch.cmd_review(Path(translated["destinations"]["result"]), "qa-promote")
+        reviewed = promote("trans-reviewer", reviewer_role, {
+            "result": [{"id": "1", "target": "こんにちは"}],
+        })
+        batch.cmd_qa("qa-promote")
+        qa_task = json.loads(
+            (self.tool / "exports" / "qa-promote" / "_batch_001_qa_task.json").read_text(encoding="utf-8")
+        )
+        finding = qa_task["findings"][0]
+        qa_attempt = promote("qa-reviewer", qa_role, {
+            "result": [{"id": "1", "target": "你好"}],
+            "report": {"schema_version": 1, "findings": [{
+                "finding_id": finding["finding_id"], "id": "1", "status": "fixed", "reason": "已译为中文",
+            }]},
+        })
+        qa_attempt_task = json.loads(
+            Path(qa_attempt["agent_input"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(qa_attempt_task["qa_reviewed_path"], qa_attempt["outputs"]["result"])
+        self.assertEqual(qa_attempt_task["qa_report_path"], qa_attempt["outputs"]["report"])
+        receipt = json.loads(
+            (self.tool / "exports" / "qa-promote" / "receipts" / "_batch_001_qa-reviewer.json")
+            .read_text(encoding="utf-8")
+        )
+        self.assertEqual({item["name"] for item in receipt["outputs"]}, {"result", "report"})
+        self.assertTrue(Path(qa_attempt["destinations"]["result"]).is_file())
+        self.assertTrue(Path(qa_attempt["destinations"]["report"]).is_file())
+        self.assertTrue(Path(reviewed["destinations"]["result"]).is_file())
+
+    def test_project_rule_update_invalidates_all_active_documents(self):
+        first = self.base / "first.txt"
+        second = self.base / "second.txt"
+        first.write_text("第一份\n", encoding="utf-8")
+        second.write_text("第二份\n", encoding="utf-8")
+        batch.cmd_init(first, project_id="document-a")
+        batch.cmd_init(second, project_id="document-b")
+        batch.cmd_next(project_arg="document-a")
+        before = self._state("document-a")["project_rules_revision"]
+        old_task = self.tool / "exports" / "document-a" / "_batch_001_to_translate.json"
+        stale_result = self.base / "stale-result.json"
+        stale_result.write_text(
+            json.dumps([{"id": "1", "target": "第一份译文"}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        batch.cmd_agent_attempt("translator", None, "document-a", attempt_id="stale_attempt")
+        policy = self.base / "updated-validation.json"
+        policy.write_text(json.dumps({
+            "newline_policy": {
+                "mode": "free", "preserve_paragraphs": True, "forbid_edge_breaks": True,
+            },
+        }), encoding="utf-8")
+
+        batch.cmd_project_config_update(policy, None, None, False)
+
+        after_a = self._state("document-a")
+        after_b = self._state("document-b")
+        self.assertNotEqual(after_a["project_rules_revision"], before)
+        self.assertEqual(after_a["project_rules_revision"], after_b["project_rules_revision"])
+        self.assertEqual(after_a["qa_status"], "not_started")
+        self.assertEqual(after_a["active_tasks"], {})
+        self.assertEqual(after_b["active_tasks"], {})
+        self.assertTrue(after_a["rules_invalidated"])
+        with self.assertRaises(SystemExit):
+            batch.cmd_review(stale_result, "document-a")
+
+        batch.cmd_next(project_arg="document-a")
+        regenerated = json.loads(old_task.read_text(encoding="utf-8"))
+        self.assertEqual(regenerated["project_rules_revision"], after_a["project_rules_revision"])
+
+    def test_runtime_tm_is_shared_across_document_workspaces(self):
+        first = self.base / "tm-first.txt"
+        second = self.base / "tm-second.txt"
+        first.write_text("裏側の世界\n", encoding="utf-8")
+        second.write_text("裏側の世界\n", encoding="utf-8")
+        batch.cmd_init(first, project_id="tm-document-a")
+        batch.cmd_next(project_arg="tm-document-a")
+        result = self._write_result("tm-document-a", 1, {"1": "里侧的世界"})
+        batch.cmd_submit(result, "tm-document-a")
+
+        runtime = self.tool / "data" / "project_tm_runtime" / "tm-document-a" / "_batch_001.json"
+        self.assertTrue(runtime.is_file())
+        batch.cmd_init(second, project_id="tm-document-b")
+        batch.cmd_next(project_arg="tm-document-b")
+        task = json.loads(
+            (self.tool / "exports" / "tm-document-b" / "_batch_001_to_translate.json")
+            .read_text(encoding="utf-8")
+        )
+        self.assertEqual(task["entries"][0]["runtime_tm_matches"][0]["target"], "里侧的世界")
+        self.assertEqual(task["entries"][0]["runtime_tm_matches"][0]["tm_document"], "tm-document-a")
+
+    def test_tm_debug_reports_scored_candidates_and_rejections(self):
+        source = self.base / "tm-debug.txt"
+        source.write_text("裏側の世界\n", encoding="utf-8")
+        permanent = self.base / "permanent.json"
+        permanent.write_text(json.dumps({"entries": [
+            {"source": "裏側の世界", "target": "里侧的世界", "context": "", "file": "master"},
+            {"source": "ことができます", "target": "可以", "context": "", "file": "master"},
+        ]}, ensure_ascii=False), encoding="utf-8")
+        batch.cmd_init(source, project_id="tm-debug", tm_permanent_path=permanent)
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as captured:
+            batch.cmd_tm_debug("裏側の世界で待つ", "tm-debug")
+
+        report = json.loads(captured.getvalue())
+        self.assertEqual(report["layers"][0]["matches"][0]["fragment_source"], "裏側の世界")
+        self.assertIn("rejected", report["layers"][0])
 
     def test_clean_qa_rejects_changed_reviewed_baseline(self):
         source = self.base / "qa_clean.txt"
@@ -751,7 +952,7 @@ class BatchWorkflowTest(unittest.TestCase):
         self._disable_qa(project_id)
         batch.cmd_submit(first, project_id)
 
-        runtime_dir = self.tool / "data" / project_id / "tm_runtime"
+        runtime_dir = self.tool / "data" / "project_tm_runtime" / project_id
         runtime_1 = runtime_dir / "_batch_001.json"
         self.assertTrue(runtime_1.is_file())
         self.assertEqual(permanent.read_bytes(), permanent_before)

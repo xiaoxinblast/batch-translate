@@ -44,6 +44,14 @@ python batch_translate/batch.py init <已交付/xxx.mqxliff> --resume
 # 同名源文件或多项目并行时显式选择 project id
 python batch_translate/batch.py next --project <project-id>
 
+# 同一项目全部文件共享规则 revision；更新会使未提交任务失效
+python batch_translate/batch.py project-config init --validation-policy <validation.json> --qa-policy <qa.json>
+python batch_translate/batch.py project-config show
+python batch_translate/batch.py project-config update --qa-plugin <qa_plugin.py>
+
+# 检查 TM 片段候选、评分分项和淘汰原因
+python batch_translate/batch.py tm-debug --text <日文> --project <project-id>
+
 # 超大文件语境分析分片与报告合并任务
 python batch_translate/batch.py context-split --max-chars 60000 --project <project-id>
 python batch_translate/batch.py context-pack <part-report...> --project <project-id>
@@ -55,7 +63,8 @@ python batch_translate/batch.py context-pack <part-report...> --project <project
 |------|------|
 | `data/style_guide.txt` | 翻译风格指南（共享） |
 | `data/term_base.xlsx` | 术语表：原文(ja) / 译文(zh) / 注释（共享） |
-| `data/<project-id>/tm_runtime/_batch_NNN.json` | 当前项目每批独立的运行期 TM（自动生成） |
+| `data/project_rules/current.json` + `revisions/<revision>/` | 项目共享的验证/QA 规则 revision |
+| `data/project_tm_runtime/<document-id>/_batch_NNN.json` | 已提交的运行期 TM（自动生成，跨文件可检索） |
 | `data/<project-id>/` | 工作副本、身份记录和状态（同名源文件自动隔离） |
 | `exports/<project-id>/` | 批次 JSON、语境分片和完成清单 |
 
@@ -67,8 +76,8 @@ python batch_translate/batch.py context-pack <part-report...> --project <project
 ## 分层翻译记忆
 
 `--tm-permanent`（旧别名 `--tm`）指定永久/权威 TM。它只读，提交不会覆盖或追加。
-提交第 N 批时，工具包会在 `data/<project-id>/tm_runtime/_batch_NNN.json` 写入该批确认译文；
-后续批次和校对会同时读取两层，永久层优先。运行期文件彼此独立，完成后仍保留在项目目录中。
+提交第 N 批时，工具包会在 `data/project_tm_runtime/<document-id>/_batch_NNN.json` 写入该批确认译文；
+后续所有文件的批次和校对会同时读取两层，永久层优先。运行期文件彼此独立，完成后仍保留在项目目录中。
 
 ### 整句匹配
 基于 difflib.SequenceMatcher 的整句模糊匹配，阈值 0.6。高相似度（≥0.85）可直接复用。
@@ -80,14 +89,15 @@ python batch_translate/batch.py context-pack <part-report...> --project <project
 全量扫描完全一致（约 15 倍加速）。
 
 ### 片段匹配（tm_fragments）
-当整句匹配不足时自动启用。n-gram 倒排索引快速召回候选 → LCS 验证实质性重叠（≥30%）→ 最多返回 3 条不同 TM 条目。
+当整句匹配不足时自动启用。3-gram 与 2-gram 倒排索引合并候选（最多 200 条）→ 在标签边界内执行 LCS → 按 IDF、片段长度、查询覆盖度、独立 TM 支持数和跨文件支持数排序。
 
 **特性：**
 - 自动排除整句已匹配的条目，无冗余
-- 同片段多 TM 条目时只保留重叠度最高的一条
+- 同片段同译文证据去重，优先保留跨文件支持更多且边界完整的匹配；同源不同译文仍保留为冲突证据
 - 嵌套短片段自动过滤
 - 全角英数归一化（ＨＰ→HP）
-- 2-gram 降级索引覆盖短词
+- 过滤助词结尾、套话和残缺词段，避免无意义片段挤占高频术语
+- 标签按边界分段，禁止删除标签后跨段拼接片段
 
 输出格式：
 ```json
@@ -112,7 +122,7 @@ python -m pip install -r requirements.txt
 python batch_translate/batch.py version --json
 ```
 
-当前 workflow protocol 为 9。
+当前 workflow protocol 为 10。
 
 ## 测试
 

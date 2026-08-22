@@ -3,3 +3,5 @@ __pycache__/
 data/
 exports/*
 !exports/.gitkeep
+_temp/
+_temp_scripts/

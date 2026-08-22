@@ -169,6 +169,33 @@ class TmIndexTest(unittest.TestCase):
         self.assertEqual(tm._entries[0]["target"], "在线设定")
         self.assertEqual(tm._entries[0]["file"], "EXP Master 2026-07-21")
 
+    def test_fragment_ranking_prefers_complete_recurring_entity(self):
+        tm = self._tm([
+            {"source": "裏側の世界", "target": "里侧的世界", "context": "", "file": "a"},
+            {"source": "裏側の世界へようこそ", "target": "欢迎来到里侧的世界", "context": "", "file": "b"},
+            {"source": "世界の裏側", "target": "世界的背面", "context": "", "file": "c"},
+            {"source": "ことができます", "target": "可以", "context": "", "file": "d"},
+        ])
+
+        debug = tm.debug_fragment_matches("裏側の世界で待っています")
+
+        self.assertEqual(debug["matches"][0]["fragment_source"], "裏側の世界")
+        self.assertEqual(debug["matches"][0]["match_target"], "里侧的世界")
+        self.assertEqual(debug["matches"][0]["supporting_files"], 2)
+        self.assertTrue(any(item["reason"] for item in debug["rejected"]))
+
+    def test_fragment_matching_never_crosses_tag_boundaries(self):
+        tm = self._tm([{
+            "source": "裏側<tag id='1' type='fmt' desc='x'/>の世界",
+            "target": "里侧的世界",
+            "context": "",
+            "file": "tagged",
+        }])
+
+        matches = tm.find_fragment_matches("裏側の世界で待つ")
+
+        self.assertEqual(matches, [])
+
     def test_result_deterministic_across_hash_seeds(self):
         """跨进程 PYTHONHASHSEED 不同时，截断边界不因 set 哈希随机化漂移。"""
         entries = []

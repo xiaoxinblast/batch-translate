@@ -14,6 +14,7 @@ from validation import (
     load_validation_policy,
     validate_batch_results,
 )
+from layout import layout_metadata
 
 
 class ValidationTest(unittest.TestCase):
@@ -130,6 +131,73 @@ class ValidationTest(unittest.TestCase):
             [{"id": "1", "target": f"译{actor}{br}文"}], expected, policy
         )
         self.assertTrue(any("禁止标签类型" in message for message in extra_br.fatal))
+
+    def test_source_guided_rejects_trailing_and_reordered_breaks(self):
+        br1 = "<tag id='1' type='br' desc='换行'/>"
+        br2 = "<tag id='2' type='br' desc='换行'/>"
+        expected = [{"id": "1", "source": f"定义{br1}后续动作{br2}结尾"}]
+
+        trailing = validate_batch_results(
+            [{"id": "1", "target": f"定义与后续动作{br1}"}], expected
+        )
+        self.assertTrue(any("以换行结尾" in message for message in trailing.fatal))
+
+        reordered = validate_batch_results(
+            [{"id": "1", "target": f"定义{br2}后续动作{br1}结尾"}], expected
+        )
+        self.assertTrue(any("标签顺序" in message for message in reordered.fatal))
+
+    def test_source_guided_preserves_hard_paragraph_but_allows_soft_omission(self):
+        br1 = "<tag id='1' type='br' desc='换行'/>"
+        br2 = "<tag id='2' type='br' desc='换行'/>"
+        br3 = "<tag id='3' type='br' desc='换行'/>"
+        expected = [{"id": "1", "source": f"定义{br1}说明{br2}{br3}后续动作"}]
+
+        report = validate_batch_results(
+            [{"id": "1", "target": f"定义与说明{br2}{br3}后续动作"}], expected
+        )
+        self.assertTrue(report.ok, report.fatal)
+
+    def test_source_guided_allows_chinese_soft_break_reflow(self):
+        br = "<tag id='1' type='br' desc='换行'/>"
+        expected = [{"id": "1", "source": f"定义句{br}后续动作说明"}]
+        report = validate_batch_results(
+            [{"id": "1", "target": f"定义句与后续{br}动作说明"}], expected
+        )
+        self.assertTrue(report.ok, report.fatal)
+
+    def test_free_mode_still_rejects_unknown_br_id(self):
+        source_br = "<tag id='1' type='br' desc='换行'/>"
+        target_br = "<tag id='2' type='br' desc='换行'/>"
+        policy = load_validation_policy()
+        policy["newline_policy"]["mode"] = "free"
+        report = validate_batch_results(
+            [{"id": "1", "target": f"译文{target_br}续文"}],
+            [{"id": "1", "source": f"原文{source_br}续文"}],
+            policy,
+        )
+        self.assertTrue(any("source 没有" in message for message in report.fatal))
+
+    def test_legacy_newline_policy_migrates_to_exact_or_source_guided(self):
+        with tempfile.TemporaryDirectory() as name:
+            strict_path = Path(name) / "strict.json"
+            guided_path = Path(name) / "guided.json"
+            strict_path.write_text(json.dumps({"enforce_newline_count": True}), encoding="utf-8")
+            guided_path.write_text(json.dumps({"enforce_newline_count": False}), encoding="utf-8")
+            self.assertEqual(load_validation_policy(strict_path)["newline_policy"]["mode"], "exact")
+            self.assertEqual(load_validation_policy(guided_path)["newline_policy"]["mode"], "source_guided")
+
+    def test_layout_metadata_exposes_soft_and_hard_source_structure(self):
+        br1 = "<tag id='1' type='br' desc='换行'/>"
+        br2 = "<tag id='2' type='br' desc='换行'/>"
+        br3 = "<tag id='3' type='br' desc='换行'/>"
+        layout = layout_metadata(
+            f"定义{br1}说明{br2}{br3}后续动作",
+            load_validation_policy()["newline_policy"],
+        )
+        self.assertEqual(layout["soft_break_tag_ids"], ["1"])
+        self.assertEqual(layout["hard_paragraph_breaks"][0]["tag_ids"], ["2", "3"])
+        self.assertEqual(layout["source_rendered_lines"], ["定义", "说明", "", "后续动作"])
 
     def test_effective_entry_policy_includes_global_empty_allowance(self):
         policy = load_validation_policy()

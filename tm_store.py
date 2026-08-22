@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """翻译记忆：JSON 存储 + difflib 模糊检索 + n-gram 片段匹配。"""
 
-import json, os, re, sys, tempfile
+import json, math, os, re, sys, tempfile
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -53,6 +53,9 @@ class TranslationMemory:
         self._loaded = False
         self._ngram_index: dict[str, set[int]] = {}
         self._ngram2_index: dict[str, set[int]] = {}
+        self._ngram_doc_freq: dict[str, int] = {}
+        self._ngram2_doc_freq: dict[str, int] = {}
+        self._fragment_support_cache: dict[str, tuple[int, int]] = {}
         self._norm_lens: list[int] = []
 
     # ── 加载 / 保存 ───────────────────────────────────────────────
@@ -185,6 +188,8 @@ class TranslationMemory:
 
     def _build_ngram_index(self):
         self._ngram_index.clear(); self._ngram2_index.clear()
+        self._ngram_doc_freq.clear(); self._ngram2_doc_freq.clear()
+        self._fragment_support_cache.clear()
         self._norm_lens.clear()
         self._index_entries(range(len(self._entries)))
 
@@ -193,11 +198,19 @@ class TranslationMemory:
             entry = self._entries[idx]
             plain = self._normalize(entry["source"])
             self._norm_lens.append(len(plain))
-            for seg in self._ngram_skip_re.split(plain):
+            grams3: set[str] = set()
+            grams2: set[str] = set()
+            for seg in self._fragment_segments(entry["source"]):
                 if len(seg) < 2: continue
                 if len(seg) >= 3:
-                    for i in range(len(seg) - 2): self._ngram_index.setdefault(seg[i:i+3], set()).add(idx)
-                for i in range(len(seg) - 1): self._ngram2_index.setdefault(seg[i:i+2], set()).add(idx)
+                    grams3.update(seg[i:i+3] for i in range(len(seg) - 2))
+                grams2.update(seg[i:i+2] for i in range(len(seg) - 1))
+            for gram in grams3:
+                self._ngram_index.setdefault(gram, set()).add(idx)
+                self._ngram_doc_freq[gram] = self._ngram_doc_freq.get(gram, 0) + 1
+            for gram in grams2:
+                self._ngram2_index.setdefault(gram, set()).add(idx)
+                self._ngram2_doc_freq[gram] = self._ngram2_doc_freq.get(gram, 0) + 1
 
     def _top_ngram_ids(self, text: str, n: int, limit: int) -> list[int]:
         """按 n-gram 命中计数取 top limit 个条目 id；同计数短条目优先（贴近 ratio）。"""
@@ -219,66 +232,185 @@ class TranslationMemory:
         return sorted(set(c3) | set(c2))
 
     def _extract_ngrams(self, text: str, n: int = 3) -> set[str]:
-        plain = self._normalize(text)
         grams = set()
-        for seg in self._ngram_skip_re.split(plain):
+        for seg in self._fragment_segments(text):
             if len(seg) < n: continue
             for i in range(len(seg) - n + 1): grams.add(seg[i:i+n])
         return grams
+
+    def _fragment_segments(self, text: str) -> list[str]:
+        """Normalize visible text without permitting a match across a tag."""
+        bounded = self._tag_re.sub("\n", text).translate(self._FW_TO_HW)
+        return [
+            segment for segment in self._ngram_skip_re.split(bounded)
+            if segment
+        ]
 
     # ── 片段匹配 ──────────────────────────────────────────────────
 
     def find_fragment_matches(
         self, source: str, top_n: int = 5,
-        candidate_limit: int = 20, exclude_sources: set[str] | None = None,
+        candidate_limit: int = 200, exclude_sources: set[str] | None = None,
     ) -> list[dict]:
-        """用 n-gram 索引找到共享子串最多的 TM 条目（已从整句匹配中排除）。
-        不截取片段——AI 自行对照完整 source/target 判断对应。"""
+        """Find useful reusable fragments without matching across inline tags."""
+        return self.debug_fragment_matches(
+            source, top_n=top_n, candidate_limit=candidate_limit,
+            exclude_sources=exclude_sources,
+        )["matches"]
+
+    def debug_fragment_matches(
+        self, source: str, top_n: int = 5,
+        candidate_limit: int = 200, exclude_sources: set[str] | None = None,
+    ) -> dict:
+        """Return fragment candidates, rejections, and deterministic score details."""
         self.load()
+        self._fragment_support_cache.clear()
         if not self._entries or not source or (not self._ngram_index and not self._ngram2_index):
-            return []
+            return {"matches": [], "candidates": [], "rejected": []}
 
-        def _get(ngram_idx, grams):
-            cs: dict[int, int] = {}
-            for g in sorted(grams):  # 确定性：同计数候选顺序稳定
-                for idx in ngram_idx.get(g, ()): cs[idx] = cs.get(idx, 0) + 1
-            return cs
+        def score_candidates(n: int) -> dict[int, float]:
+            grams = self._extract_ngrams(source, n=n)
+            index = self._ngram_index if n == 3 else self._ngram2_index
+            frequencies = self._ngram_doc_freq if n == 3 else self._ngram2_doc_freq
+            values: dict[int, float] = {}
+            for gram in sorted(grams):
+                idf = math.log((len(self._entries) + 1) / (frequencies.get(gram, 0) + 1)) + 1.0
+                for idx in index.get(gram, ()):
+                    values[idx] = values.get(idx, 0.0) + idf
+            return values
 
-        candidate_scores = _get(self._ngram_index, self._extract_ngrams(source))
-        if not candidate_scores and self._ngram2_index:
-            candidate_scores = _get(self._ngram2_index, self._extract_ngrams(source, n=2))
-        if not candidate_scores: return []
-
+        scores3 = score_candidates(3)
+        scores2 = score_candidates(2)
+        candidate_scores: dict[int, float] = {}
+        for index, score in scores3.items():
+            candidate_scores[index] = candidate_scores.get(index, 0.0) + score
+        for index, score in scores2.items():
+            candidate_scores[index] = candidate_scores.get(index, 0.0) + score
+        if not candidate_scores:
+            return {"matches": [], "candidates": [], "rejected": []}
         exclude = exclude_sources or set()
-        # n-gram 找候选 → LCS 验证实质性重叠
-        qp = self._tag_re.sub("", source)
-        results = []
-        for idx, count in sorted(candidate_scores.items(), key=lambda x: -x[1])[:candidate_limit]:
+        query_segments = self._fragment_segments(source)
+        query_len = max(1, sum(len(part) for part in query_segments))
+        candidates = sorted(
+            candidate_scores,
+            key=lambda idx: (-candidate_scores[idx], self._norm_lens[idx], idx),
+        )[:candidate_limit]
+        results: list[dict] = []
+        rejected: list[dict] = []
+        for idx in candidates:
             e = self._entries[idx]
-            if e["source"] in exclude: continue
-            ep = self._tag_re.sub("", e["source"])
-            if len(ep) < 10: continue
-            # LCS 最长匹配块 / 条目长度 → 重叠度
-            m = SequenceMatcher(None, qp, ep)
-            match = m.find_longest_match(0, len(qp), 0, len(ep))
-            overlap = match.size / len(ep) if len(ep) > 0 else 0
-            if overlap < 0.3: continue
-            fs = qp[match.a:match.a + match.size].strip()
-            # 同片段去重：保留重叠度最高的那一条 TM 条目
-            existing = next((r for r in results if r["fragment_source"] == fs), None)
-            if existing:
-                if overlap > existing.get("_overlap", 0):
-                    existing["match_source"] = e["source"]
-                    existing["match_target"] = e["target"]
-                    existing["match_file"] = e.get("file", "")
-                    existing["_overlap"] = overlap
+            diagnostic = {
+                "source": e["source"], "file": e.get("file", ""),
+                "ngram_score": round(candidate_scores[idx], 4),
+            }
+            if e["source"] in exclude:
+                diagnostic["reason"] = "already_exact_match"
+                rejected.append(diagnostic)
                 continue
-            results.append({"fragment_source": fs, "match_source": e["source"], "match_target": e["target"], "match_file": e.get("file", ""), "_overlap": overlap})
-        for r in results: del r["_overlap"]
-        # 包含去重
-        filtered = [r for r in results
-                    if not any(r is not r2 and r["fragment_source"] in r2["fragment_source"] for r2 in results)]
-        return filtered[:top_n]
+            best: tuple[int, str, str] | None = None
+            for query_segment in query_segments:
+                for entry_segment in self._fragment_segments(e["source"]):
+                    match = SequenceMatcher(None, query_segment, entry_segment).find_longest_match(
+                        0, len(query_segment), 0, len(entry_segment)
+                    )
+                    fragment = query_segment[match.a:match.a + match.size]
+                    if best is None or match.size > best[0]:
+                        best = (match.size, fragment, entry_segment)
+            if best is None or best[0] < 4:
+                diagnostic["reason"] = "fragment_too_short_or_no_boundary_safe_match"
+                rejected.append(diagnostic)
+                continue
+            length, fragment, entry_segment = best
+            if self._is_weak_fragment(fragment):
+                diagnostic["reason"] = "weak_or_incomplete_fragment"
+                diagnostic["fragment"] = fragment
+                rejected.append(diagnostic)
+                continue
+            support_sources, support_files = self._fragment_support(fragment)
+            coverage = length / query_len
+            entry_coverage = length / max(1, len(entry_segment))
+            score = (
+                candidate_scores[idx]
+                + length * 2.0
+                + coverage * 10.0
+                + entry_coverage * 2.0
+                + support_sources * 1.25
+                + support_files * 0.75
+            )
+            results.append({
+                "fragment_source": fragment,
+                "match_source": e["source"],
+                "match_target": e["target"],
+                "match_file": e.get("file", ""),
+                "fragment_score": round(score, 4),
+                "query_coverage": round(coverage, 4),
+                "supporting_sources": support_sources,
+                "supporting_files": support_files,
+            })
+
+        # Same fragment and same translation is redundant evidence.  Keep the
+        # strongest evidence, while retaining genuinely conflicting translations.
+        deduped: dict[tuple[str, str], dict] = {}
+        for item in results:
+            key = (item["fragment_source"], item["match_target"])
+            old = deduped.get(key)
+            if old is None or self._fragment_sort_key(item) < self._fragment_sort_key(old):
+                deduped[key] = item
+        ordered = sorted(deduped.values(), key=self._fragment_sort_key)
+        filtered = [
+            item for item in ordered
+            if not any(
+                item is not other
+                and item["fragment_source"] in other["fragment_source"]
+                and other["fragment_score"] >= item["fragment_score"]
+                for other in ordered
+            )
+        ]
+        return {
+            "matches": filtered[:top_n],
+            "candidates": [
+                {"source": self._entries[idx]["source"], "file": self._entries[idx].get("file", ""),
+                 "ngram_score": round(candidate_scores[idx], 4)}
+                for idx in candidates
+            ],
+            "rejected": rejected,
+        }
+
+    @staticmethod
+    def _fragment_sort_key(item: dict) -> tuple:
+        return (
+            -float(item.get("fragment_score", 0)),
+            -int(item.get("supporting_files", 0)),
+            -int(item.get("supporting_sources", 0)),
+            -len(item.get("fragment_source", "")),
+            item.get("match_file", ""), item.get("match_source", ""),
+        )
+
+    @staticmethod
+    def _is_weak_fragment(fragment: str) -> bool:
+        if len(fragment) < 4:
+            return True
+        # Isolated grammatical tails and partially consumed verb endings make
+        # poor translation evidence even when their n-grams are frequent.
+        return bool(
+            re.search(r"^(?:して|として|また|この|その|あの|を|に|が|は|の|と|へ|で|も|や)", fragment)
+            or re.search(r"(?:を|に|が|は|の|と|へ|で|も|や|て|し|い|る)$", fragment)
+        )
+
+    def _fragment_support(self, fragment: str) -> tuple[int, int]:
+        cached = self._fragment_support_cache.get(fragment)
+        if cached is not None:
+            return cached
+        sources: set[str] = set()
+        files: set[str] = set()
+        for entry in self._entries:
+            if any(fragment in segment for segment in self._fragment_segments(entry["source"])):
+                sources.add(entry["source"])
+                if entry.get("file"):
+                    files.add(str(entry["file"]))
+        value = (len(sources), len(files))
+        self._fragment_support_cache[fragment] = value
+        return value
 
 
 if __name__ == "__main__":

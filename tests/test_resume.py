@@ -74,8 +74,8 @@ class InitResumeTest(unittest.TestCase):
             batch._ACTIVE_PROJECT.read_text(encoding="utf-8"), self.STEM
         )
         self.assertEqual(
-            [path.name for path in (self.bt / "data").iterdir() if path.is_dir()],
-            [self.STEM],
+            {path.name for path in (self.bt / "data").iterdir() if path.is_dir()},
+            {"project_rules", self.STEM},
         )
 
 
